@@ -9,20 +9,7 @@ pub mod ui;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-
-use connectors::{
-    amp::AmpConnector,
-    claude_code::ClaudeCodeConnector,
-    cline::ClineConnector,
-    codex::CodexConnector,
-    gemini::GeminiConnector,
-    opencode::OpenCodeConnector,
-    Connector,
-    NormalizedConversation,
-};
 use indexer::IndexOptions;
-use model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-use storage::sqlite::SqliteStorage;
 
 /// Command-line interface.
 #[derive(Parser, Debug)]
@@ -44,7 +31,7 @@ pub struct Cli {
 pub enum Commands {
     /// Launch interactive TUI
     Tui,
-    /// Run indexer (stub)
+    /// Run indexer
     Index {
         /// Perform full rebuild
         #[arg(long)]
@@ -75,63 +62,6 @@ fn run_index(db_override: Option<PathBuf>, full: bool, watch: bool) -> Result<()
         data_dir,
     };
     indexer::run_index(opts)
-}
-
-fn persist_conversation(storage: &mut SqliteStorage, conv: &NormalizedConversation) -> Result<()> {
-    let agent = Agent {
-        slug: conv.agent_slug.clone(),
-        name: conv.agent_slug.clone(),
-        version: None,
-        kind: AgentKind::Cli,
-    };
-    let agent_id = storage.ensure_agent(&agent)?;
-
-    let workspace_id = if let Some(ws) = &conv.workspace {
-        Some(storage.ensure_workspace(ws, None)?)
-    } else {
-        None
-    };
-
-    let messages = conv
-        .messages
-        .iter()
-        .map(|m| Message {
-            idx: m.idx,
-            role: map_role(&m.role),
-            author: m.author.clone(),
-            created_at: m.created_at,
-            content: m.content.clone(),
-            extra_json: m.extra.clone(),
-            snippets: Vec::new(),
-        })
-        .collect();
-
-    let conversation = Conversation {
-        id: 0,
-        agent_slug: conv.agent_slug.clone(),
-        workspace: conv.workspace.clone(),
-        external_id: conv.external_id.clone(),
-        title: conv.title.clone(),
-        source_path: conv.source_path.clone(),
-        started_at: conv.started_at,
-        ended_at: conv.ended_at,
-        approx_tokens: None,
-        metadata_json: conv.metadata.clone(),
-        messages,
-    };
-
-    let _ = storage.insert_conversation_tree(agent_id, workspace_id, &conversation)?;
-    Ok(())
-}
-
-fn map_role(role: &str) -> MessageRole {
-    match role {
-        "user" => MessageRole::User,
-        "assistant" | "agent" => MessageRole::Agent,
-        "tool" => MessageRole::Tool,
-        "system" => MessageRole::System,
-        other => MessageRole::Other(other.to_string()),
-    }
 }
 
 fn default_db_path() -> PathBuf {
