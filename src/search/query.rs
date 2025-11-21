@@ -5,10 +5,10 @@ use std::path::Path;
 use anyhow::Result;
 use tantivy::collector::TopDocs;
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery};
-use tantivy::schema::{IndexRecordOption, Term};
+use tantivy::schema::{Document, IndexRecordOption, Term};
 use tantivy::{Index, IndexReader};
 
-use crate::search::tantivy::{build_schema, fields_from_schema};
+use crate::search::tantivy::fields_from_schema;
 
 #[derive(Debug, Clone, Default)]
 pub struct SearchFilters {
@@ -97,7 +97,7 @@ impl SearchClient {
         let top_docs = searcher.search(&final_query, &TopDocs::with_limit(limit))?;
         let mut hits = Vec::new();
         for (score, addr) in top_docs {
-            let doc = searcher.doc(addr)?;
+            let doc: Document = searcher.doc(addr)?;
             let title = doc
                 .get_first(self.fields.title)
                 .and_then(|v| v.as_text())
