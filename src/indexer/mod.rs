@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -55,8 +57,9 @@ pub fn run_index(opts: IndexOptions) -> Result<()> {
 
     if opts.watch {
         let opts_clone = opts.clone();
+        let state = Arc::new(Mutex::new(HashMap::new()));
         watch_sources(move |paths| {
-            let _ = reindex_paths(&opts_clone, paths);
+            let _ = reindex_paths(&opts_clone, paths, state.clone());
         })?;
     }
 
@@ -139,119 +142,105 @@ fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
     Ok(())
 }
 
-fn reindex_paths(opts: &IndexOptions, paths: Vec<PathBuf>) -> Result<()> {
+fn reindex_paths(
+    opts: &IndexOptions,
+    paths: Vec<PathBuf>,
+    state: Arc<Mutex<HashMap<ConnectorKind, i64>>>,
+) -> Result<()> {
     let mut storage = SqliteStorage::open(&opts.db_path)?;
     let mut t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir)?)?;
 
     let triggers = classify_paths(paths);
-    let mut connectors: Vec<Box<dyn Connector>> = Vec::new();
-    if triggers.codex.is_some() {
-        connectors.push(Box::new(CodexConnector::new()));
-    }
-    if triggers.cline.is_some() {
-        connectors.push(Box::new(ClineConnector::new()));
-    }
-    if triggers.gemini.is_some() {
-        connectors.push(Box::new(GeminiConnector::new()));
-    }
-    if triggers.claude.is_some() {
-        connectors.push(Box::new(ClaudeCodeConnector::new()));
-    }
-    if triggers.amp.is_some() {
-        connectors.push(Box::new(AmpConnector::new()));
-    }
-    if triggers.opencode.is_some() {
-        connectors.push(Box::new(OpenCodeConnector::new()));
+    if triggers.is_empty() {
+        return Ok(());
     }
 
-    for (conn, since_ts) in triggers.connectors_with_since() {
+    for (kind, ts) in triggers {
+        let conn: Box<dyn Connector> = match kind {
+            ConnectorKind::Codex => Box::new(CodexConnector::new()),
+            ConnectorKind::Cline => Box::new(ClineConnector::new()),
+            ConnectorKind::Gemini => Box::new(GeminiConnector::new()),
+            ConnectorKind::Claude => Box::new(ClaudeCodeConnector::new()),
+            ConnectorKind::Amp => Box::new(AmpConnector::new()),
+            ConnectorKind::OpenCode => Box::new(OpenCodeConnector::new()),
+        };
         let detect = conn.detect();
         if !detect.detected {
             continue;
         }
+        let since_ts = {
+            let guard = state.lock().unwrap();
+            guard
+                .get(&kind)
+                .cloned()
+                .or_else(|| ts.map(|v| v.saturating_sub(1)))
+        };
         let ctx = crate::connectors::ScanContext {
             data_root: opts.data_dir.clone(),
             since_ts,
         };
         let convs = conn.scan(&ctx)?;
         ingest_batch(&mut storage, &mut t_index, convs)?;
+        if let Some(ts_val) = ts {
+            let mut guard = state.lock().unwrap();
+            let entry = guard.entry(kind).or_insert(ts_val);
+            *entry = (*entry).max(ts_val);
+        }
     }
     t_index.commit()?;
     Ok(())
 }
 
-#[derive(Default)]
-struct PathTriggers {
-    codex: Option<i64>,
-    cline: Option<i64>,
-    gemini: Option<i64>,
-    claude: Option<i64>,
-    amp: Option<i64>,
-    opencode: Option<i64>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ConnectorKind {
+    Codex,
+    Cline,
+    Gemini,
+    Claude,
+    Amp,
+    OpenCode,
 }
 
-impl PathTriggers {
-    fn connectors_with_since(self) -> Vec<(Box<dyn Connector>, Option<i64>)> {
-        let mut v: Vec<(Box<dyn Connector>, Option<i64>)> = Vec::new();
-        if let Some(ts) = self.codex {
-            v.push((Box::new(CodexConnector::new()), Some(ts)));
-        }
-        if let Some(ts) = self.cline {
-            v.push((Box::new(ClineConnector::new()), Some(ts)));
-        }
-        if let Some(ts) = self.gemini {
-            v.push((Box::new(GeminiConnector::new()), Some(ts)));
-        }
-        if let Some(ts) = self.claude {
-            v.push((Box::new(ClaudeCodeConnector::new()), Some(ts)));
-        }
-        if let Some(ts) = self.amp {
-            v.push((Box::new(AmpConnector::new()), Some(ts)));
-        }
-        if let Some(ts) = self.opencode {
-            v.push((Box::new(OpenCodeConnector::new()), Some(ts)));
-        }
-        v
-    }
-}
-
-fn classify_paths(paths: Vec<PathBuf>) -> PathTriggers {
-    let mut t = PathTriggers::default();
-    let mut max_mtime: Option<i64> = None;
+fn classify_paths(paths: Vec<PathBuf>) -> Vec<(ConnectorKind, Option<i64>)> {
+    let mut map: HashMap<ConnectorKind, Option<i64>> = HashMap::new();
     for p in paths {
-        let s = p.to_string_lossy();
-
         if let Ok(meta) = std::fs::metadata(&p)
             && let Ok(time) = meta.modified()
             && let Ok(dur) = time.duration_since(std::time::UNIX_EPOCH)
         {
-            let ts = dur.as_millis() as i64;
-            max_mtime = Some(max_mtime.map_or(ts, |m| m.max(ts)));
-            // assign per-connector specific mtime
-            if s.contains(".codex") || s.contains("codex/sessions") || s.contains("rollout-") {
-                t.codex = Some(ts);
-            }
-            if s.contains("saoudrizwan.claude-dev") || s.contains("cline") {
-                t.cline = Some(ts);
-            }
-            if s.contains(".gemini/tmp") {
-                t.gemini = Some(ts);
-            }
-            if s.contains(".claude/projects")
-                || s.ends_with(".claude")
-                || s.ends_with(".claude.json")
-            {
-                t.claude = Some(ts);
-            }
-            if s.contains("sourcegraph.amp") || s.contains("/amp/") {
-                t.amp = Some(ts);
-            }
-            if s.contains(".opencode") || s.contains("/opencode/") {
-                t.opencode = Some(ts);
+            let ts = Some(dur.as_millis() as i64);
+            let s = p.to_string_lossy();
+            let tag =
+                if s.contains(".codex") || s.contains("codex/sessions") || s.contains("rollout-") {
+                    Some(ConnectorKind::Codex)
+                } else if s.contains("saoudrizwan.claude-dev") || s.contains("cline") {
+                    Some(ConnectorKind::Cline)
+                } else if s.contains(".gemini/tmp") {
+                    Some(ConnectorKind::Gemini)
+                } else if s.contains(".claude/projects")
+                    || s.ends_with(".claude")
+                    || s.ends_with(".claude.json")
+                {
+                    Some(ConnectorKind::Claude)
+                } else if s.contains("sourcegraph.amp") || s.contains("/amp/") {
+                    Some(ConnectorKind::Amp)
+                } else if s.contains(".opencode") || s.contains("/opencode/") {
+                    Some(ConnectorKind::OpenCode)
+                } else {
+                    None
+                };
+
+            if let Some(kind) = tag {
+                let entry = map.entry(kind).or_insert(None);
+                *entry = match (*entry, ts) {
+                    (Some(prev), Some(cur)) => Some(prev.max(cur)),
+                    (None, Some(cur)) => Some(cur),
+                    _ => *entry,
+                };
             }
         }
     }
-    t
+    map.into_iter().collect()
 }
 
 pub mod persist {
