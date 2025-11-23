@@ -32,17 +32,22 @@ pub fn run_index(opts: IndexOptions) -> Result<()> {
         t_index.delete_all()?;
     }
 
-    let connectors: Vec<Box<dyn Connector>> = vec![
-        Box::new(CodexConnector::new()),
-        Box::new(ClineConnector::new()),
-        Box::new(GeminiConnector::new()),
-        Box::new(ClaudeCodeConnector::new()),
-        Box::new(OpenCodeConnector::new()),
-        Box::new(AmpConnector::new()),
+    let connectors: Vec<(&'static str, Box<dyn Connector>)> = vec![
+        ("codex", Box::new(CodexConnector::new())),
+        ("cline", Box::new(ClineConnector::new())),
+        ("gemini", Box::new(GeminiConnector::new())),
+        ("claude", Box::new(ClaudeCodeConnector::new())),
+        ("opencode", Box::new(OpenCodeConnector::new())),
+        ("amp", Box::new(AmpConnector::new())),
     ];
 
-    for conn in connectors {
+    for (name, conn) in connectors {
         let detect = conn.detect();
+        tracing::info!(
+            connector = name,
+            detected = detect.detected,
+            "connector_detect"
+        );
         if !detect.detected {
             continue;
         }
@@ -51,7 +56,12 @@ pub fn run_index(opts: IndexOptions) -> Result<()> {
             since_ts: None,
         };
         let convs = conn.scan(&ctx)?;
-        ingest_batch(&mut storage, &mut t_index, convs)?;
+        ingest_batch(&mut storage, &mut t_index, &convs)?;
+        tracing::info!(
+            connector = name,
+            conversations = convs.len(),
+            "connector_ingest"
+        );
     }
 
     t_index.commit()?;
@@ -70,10 +80,10 @@ pub fn run_index(opts: IndexOptions) -> Result<()> {
 fn ingest_batch(
     storage: &mut SqliteStorage,
     t_index: &mut TantivyIndex,
-    convs: Vec<NormalizedConversation>,
+    convs: &[NormalizedConversation],
 ) -> Result<()> {
     for conv in convs {
-        persist::persist_conversation(storage, t_index, &conv)?;
+        persist::persist_conversation(storage, t_index, conv)?;
     }
     Ok(())
 }
@@ -181,7 +191,8 @@ fn reindex_paths(
             since_ts,
         };
         let convs = conn.scan(&ctx)?;
-        ingest_batch(&mut storage, &mut t_index, convs)?;
+        tracing::info!(?kind, conversations = convs.len(), since_ts, "watch_scan");
+        ingest_batch(&mut storage, &mut t_index, &convs)?;
         if let Some(ts_val) = ts {
             let mut guard = state.lock().unwrap();
             let entry = guard.entry(kind).or_insert(ts_val);
@@ -282,6 +293,7 @@ pub mod persist {
         t_index: &mut TantivyIndex,
         conv: &NormalizedConversation,
     ) -> Result<()> {
+        tracing::info!(agent = %conv.agent_slug, messages = conv.messages.len(), "persist_conversation");
         let agent = Agent {
             id: None,
             slug: conv.agent_slug.clone(),
@@ -350,6 +362,229 @@ pub mod persist {
             "tool" => MessageRole::Tool,
             "system" => MessageRole::System,
             other => MessageRole::Other(other.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connectors::{NormalizedConversation, NormalizedMessage};
+    use tempfile::TempDir;
+
+    fn norm_msg(idx: i64, created_at: i64) -> NormalizedMessage {
+        NormalizedMessage {
+            idx,
+            role: "user".into(),
+            author: Some("u".into()),
+            created_at: Some(created_at),
+            content: format!("msg-{idx}"),
+            extra: serde_json::json!({}),
+            snippets: Vec::new(),
+        }
+    }
+
+    fn norm_conv(
+        external_id: Option<&str>,
+        msgs: Vec<NormalizedMessage>,
+    ) -> NormalizedConversation {
+        NormalizedConversation {
+            agent_slug: "tester".into(),
+            external_id: external_id.map(|s| s.to_owned()),
+            title: Some("Demo".into()),
+            workspace: Some(PathBuf::from("/workspace/demo")),
+            source_path: PathBuf::from("/logs/demo.jsonl"),
+            started_at: msgs.first().and_then(|m| m.created_at),
+            ended_at: msgs.last().and_then(|m| m.created_at),
+            metadata: serde_json::json!({}),
+            messages: msgs,
+        }
+    }
+
+    #[test]
+    fn reset_storage_clears_data_but_leaves_meta() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conv = norm_conv(Some("c1"), vec![norm_msg(0, 10)]);
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &crate::model::types::Conversation {
+                    id: None,
+                    agent_slug: conv.agent_slug.clone(),
+                    workspace: conv.workspace.clone(),
+                    external_id: conv.external_id.clone(),
+                    title: conv.title.clone(),
+                    source_path: conv.source_path.clone(),
+                    started_at: conv.started_at,
+                    ended_at: conv.ended_at,
+                    approx_tokens: None,
+                    metadata_json: conv.metadata.clone(),
+                    messages: conv
+                        .messages
+                        .iter()
+                        .map(|m| crate::model::types::Message {
+                            id: None,
+                            idx: m.idx,
+                            role: crate::model::types::MessageRole::User,
+                            author: m.author.clone(),
+                            created_at: m.created_at,
+                            content: m.content.clone(),
+                            extra_json: m.extra.clone(),
+                            snippets: Vec::new(),
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+
+        let msg_count: i64 = storage
+            .raw()
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msg_count, 1);
+
+        reset_storage(&mut storage).unwrap();
+
+        let msg_count: i64 = storage
+            .raw()
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msg_count, 0);
+        assert_eq!(storage.schema_version().unwrap(), 3);
+    }
+
+    #[test]
+    fn persist_append_only_adds_new_messages_to_index() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+
+        let conv1 = norm_conv(Some("ext"), vec![norm_msg(0, 100), norm_msg(1, 200)]);
+        persist::persist_conversation(&mut storage, &mut index, &conv1).unwrap();
+        index.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        assert_eq!(reader.searcher().num_docs(), 2);
+
+        let conv2 = norm_conv(
+            Some("ext"),
+            vec![norm_msg(0, 100), norm_msg(1, 200), norm_msg(2, 300)],
+        );
+        persist::persist_conversation(&mut storage, &mut index, &conv2).unwrap();
+        index.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        assert_eq!(reader.searcher().num_docs(), 3);
+    }
+
+    #[test]
+    fn classify_paths_uses_latest_mtime_per_connector() {
+        let tmp = TempDir::new().unwrap();
+        let codex = tmp.path().join(".codex/sessions/rollout-1.jsonl");
+        std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        std::fs::write(&codex, "{}\n{}").unwrap();
+
+        let claude = tmp.path().join("project/.claude.json");
+        std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        std::fs::write(&claude, "{}").unwrap();
+
+        let paths = vec![codex.clone(), claude.clone()];
+        let classified = classify_paths(paths);
+
+        let kinds: std::collections::HashSet<_> = classified.iter().map(|(k, _)| *k).collect();
+        assert!(kinds.contains(&ConnectorKind::Codex));
+        assert!(kinds.contains(&ConnectorKind::Claude));
+
+        for (_, ts) in classified {
+            assert!(ts.is_some(), "mtime should be captured");
+        }
+    }
+
+    #[test]
+    fn watch_state_round_trips_to_disk() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let mut state = HashMap::new();
+        state.insert(ConnectorKind::Codex, 123);
+        state.insert(ConnectorKind::Gemini, 456);
+
+        save_watch_state(&data_dir, &state).unwrap();
+
+        let loaded = load_watch_state(&data_dir);
+        assert_eq!(loaded.get(&ConnectorKind::Codex), Some(&123));
+        assert_eq!(loaded.get(&ConnectorKind::Gemini), Some(&456));
+    }
+
+    #[test]
+    fn watch_state_updates_after_reindex_paths() {
+        let tmp = TempDir::new().unwrap();
+        let xdg = tmp.path().join("xdg");
+        std::fs::create_dir_all(&xdg).unwrap();
+        let prev_xdg = std::env::var("XDG_DATA_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", xdg.to_string_lossy().to_string());
+        }
+
+        let data_dir = crate::default_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Prepare amp fixture under data dir so detection + scan succeed.
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let amp_file = amp_dir.join("thread-002.json");
+        std::fs::write(
+            &amp_file,
+            r#"{
+  "id": "thread-002",
+  "title": "Amp test",
+  "messages": [
+    {"role":"user","text":"hi","createdAt":1700000000100},
+    {"role":"assistant","text":"hello","createdAt":1700000000200}
+  ]
+}
+"#,
+        )
+        .unwrap();
+
+        let opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+        };
+
+        let state = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        reindex_paths(&opts, vec![amp_file.clone()], state.clone()).unwrap();
+
+        let loaded = load_watch_state(&data_dir);
+        assert!(loaded.contains_key(&ConnectorKind::Amp));
+        let ts = loaded.get(&ConnectorKind::Amp).copied().unwrap();
+        assert!(ts > 0);
+
+        if let Some(prev) = prev_xdg {
+            unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
+        } else {
+            unsafe { std::env::remove_var("XDG_DATA_HOME") };
         }
     }
 }

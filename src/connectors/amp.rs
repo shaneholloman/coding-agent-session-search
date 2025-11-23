@@ -150,6 +150,13 @@ impl Connector for AmpConnector {
                             metadata: val.clone(),
                             messages,
                         });
+                        tracing::info!(
+                            target: "connector::amp",
+                            source = %path.display(),
+                            messages = convs.last().map(|c| c.messages.len()).unwrap_or(0),
+                            since_ts = ctx.since_ts,
+                            "amp_scan"
+                        );
                     }
                 }
             }
