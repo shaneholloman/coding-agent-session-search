@@ -5,6 +5,7 @@ Param(
   [string]$Repo = "coding-agent-search",
   [string]$Checksum = "",
   [string]$ChecksumUrl = "",
+  [string]$ArtifactUrl = "",
   [switch]$EasyMode
 )
 
@@ -12,7 +13,7 @@ $ErrorActionPreference = "Stop"
 $os = "windows"
 $arch = if ([Environment]::Is64BitProcess) { "x86_64" } else { "x86" }
 $zip = "coding-agent-search-$Version-$os-$arch.zip"
-$url = "https://github.com/$Owner/$Repo/releases/download/$Version/$zip"
+$url = if ($ArtifactUrl) { $ArtifactUrl } else { "https://github.com/$Owner/$Repo/releases/download/$Version/$zip" }
 $tmp = New-TemporaryFile | Split-Path
 
 Write-Host "Downloading $url"

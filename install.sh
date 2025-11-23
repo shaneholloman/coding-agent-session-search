@@ -10,6 +10,7 @@ OWNER="${OWNER:-coding-agent-search}"
 REPO="${REPO:-coding-agent-search}"
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
+ARTIFACT_URL="${ARTIFACT_URL:-}"
 EASY=0
 
 while [ $# -gt 0 ]; do
@@ -33,6 +34,9 @@ case "$ARCH" in
 esac
 TAR="coding-agent-search-${VERSION}-${OS}-${ARCH}.tar.gz"
 URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
+if [ -n "$ARTIFACT_URL" ]; then
+  URL="$ARTIFACT_URL"
+fi
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
