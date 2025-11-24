@@ -26,6 +26,8 @@ jobs:
   dist:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust nightly
