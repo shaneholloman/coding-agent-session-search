@@ -36,6 +36,8 @@ jobs:
         run: cargo install cargo-dist --locked --root ~/.cargo
       - name: Add cargo bin to PATH
         run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: dist init
+        run: ~/.cargo/bin/dist init --yes --ci github --installer shell --installer powershell
       - name: Build distributions
         env:
           CARGO_TERM_COLOR: always
