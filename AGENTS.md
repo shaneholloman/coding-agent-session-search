@@ -220,6 +220,18 @@ Pitfalls to avoid
 - Don't create or manage tasks in Mail; treat Beads as the single task queue.
 - Always include `bd-###` in message `thread_id` to avoid ID drift across tools.
 
+---
+
+Prepared blurb you can paste into other agents' guides (AGENTS.md / CLAUDE.md)
+
+> **cass (Coding Agent Session Search)** — CLI/TUI to search local agent histories.  
+> - Robot mode: `cass --robot-help` (automation contract) and `cass robot-docs <topic>` for focused docs.  
+> - JSON search: `cass search "query" --robot [--limit N --offset N --agent codex --workspace /path]`.  
+> - Inspect hits: `cass view <source_path> -n <line> --json`.  
+> - Index first: `cass index --full` (or `cass index --watch`).  
+> - stdout=data only; stderr=diagnostics; exit codes stable (see `--robot-help`).  
+> - Non-TTY automation won’t start TUI unless you explicitly run `cass tui`.
+
 ### ast-grep vs ripgrep (quick guidance)
 
 **Use `ast-grep` when structure matters.** It parses code and matches AST nodes, so results ignore comments/strings, understand syntax, and can **safely rewrite** code.
