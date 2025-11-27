@@ -5,7 +5,6 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::ui::components::theme::ThemePalette;
 use crate::ui::data::InputMode;
-use ratatui::widgets::Wrap;
 
 pub fn search_bar(
     query: &str,
@@ -104,5 +103,7 @@ pub fn search_bar(
         )
         .style(Style::default())
         .alignment(Alignment::Left)
-        .wrap(Wrap { trim: true })
+    // Disable wrapping so the cursor at the end remains visible on long queries.
+    // TODO: Implement proper horizontal scrolling for input fields.
+    // .wrap(Wrap { trim: true })
 }
