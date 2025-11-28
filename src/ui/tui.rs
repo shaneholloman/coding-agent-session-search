@@ -1638,29 +1638,40 @@ pub fn run_tui(
     let mut last_detail_area: Option<Rect> = None;
     let mut last_pane_rects: Vec<Rect> = Vec::new();
 
-    // Helper to render progress
-    let render_progress = |progress: &std::sync::Arc<crate::indexer::IndexingProgress>| -> String {
+    // Helper to get indexing phase info (returns phase, current, total, is_rebuild, pct)
+    let get_indexing_state = |progress: &std::sync::Arc<crate::indexer::IndexingProgress>| -> (usize, usize, usize, bool, usize) {
         use std::sync::atomic::Ordering;
         let phase = progress.phase.load(Ordering::Relaxed);
-        if phase == 0 {
-            return String::new();
-        }
         let total = progress.total.load(Ordering::Relaxed);
         let current = progress.current.load(Ordering::Relaxed);
         let is_rebuild = progress.is_rebuilding.load(Ordering::Relaxed);
-
-        let phase_str = if phase == 1 { "Scanning" } else { "Indexing" };
         let pct = if total > 0 {
             (current as f32 / total as f32 * 100.0) as usize
         } else {
             0
         };
+        (phase, current, total, is_rebuild, pct)
+    };
 
-        let mut s = format!(" | {} {}/{} ({}%)", phase_str, current, total, pct);
+    // Helper to render progress for footer (enhanced with icons)
+    let render_progress = |progress: &std::sync::Arc<crate::indexer::IndexingProgress>| -> String {
+        let (phase, current, total, is_rebuild, pct) = get_indexing_state(progress);
+        if phase == 0 {
+            return String::new();
+        }
+
+        // Phase-specific icons and labels
+        let (icon, phase_str) = match phase {
+            1 => ("🔍", "Discovering"),
+            2 => ("📦", "Indexing"),
+            _ => ("⏳", "Processing"),
+        };
+
+        let mut s = format!(" | {} {} {}/{} ({}%)", icon, phase_str, current, total, pct);
         if is_rebuild {
-            s.push_str(" [REBUILDING INDEX - Search unavailable]");
-        } else {
-            s.push_str(" [Updating]");
+            s.push_str(" ⚠ FULL REBUILD - Search unavailable");
+        } else if phase > 0 {
+            s.push_str(" · Results may be incomplete");
         }
         s
     };
@@ -1741,35 +1752,107 @@ pub fn run_tui(
                     // Clear pane rects when no panes (avoid stale click detection)
                     last_pane_rects.clear();
                     let mut lines: Vec<Line> = Vec::new();
-                    if query.trim().is_empty() && !query_history.is_empty() {
-                        lines.push(Line::from(Span::styled(
-                            "Recent queries (Enter to load):",
-                            palette.title(),
-                        )));
-                        for (idx, q) in query_history.iter().take(5).enumerate() {
-                            let selected = suggestion_idx == Some(idx);
-                            lines.push(Line::from(Span::styled(
-                                format!("{} {}", if selected { "▶" } else { " " }, q),
-                                if selected {
-                                    Style::default()
-                                        .fg(palette.accent)
-                                        .add_modifier(Modifier::BOLD)
-                                } else {
-                                    Style::default().fg(palette.hint)
-                                },
-                            )));
+
+                    // Check if indexing is in progress - show prominent banner
+                    let indexing_active = progress.as_ref().map(|p| {
+                        get_indexing_state(p)
+                    });
+
+                    if let Some((phase, current, total, is_rebuild, pct)) = indexing_active {
+                        if phase > 0 {
+                            // Show indexing banner
+                            lines.push(Line::from(""));
+                            if is_rebuild {
+                                lines.push(Line::from(vec![
+                                    Span::styled("  ⚠ ", Style::default().fg(palette.system)),
+                                    Span::styled(
+                                        "REBUILDING INDEX",
+                                        Style::default().fg(palette.system).add_modifier(Modifier::BOLD),
+                                    ),
+                                ]));
+                                lines.push(Line::from(""));
+                                lines.push(Line::from(Span::styled(
+                                    "  Search is unavailable during a full rebuild.",
+                                    Style::default().fg(palette.hint),
+                                )));
+                                lines.push(Line::from(Span::styled(
+                                    "  This typically takes 30-60 seconds.",
+                                    Style::default().fg(palette.hint),
+                                )));
+                            } else {
+                                let (icon, phase_label) = match phase {
+                                    1 => ("🔍", "Discovering sessions..."),
+                                    2 => ("📦", "Building search index..."),
+                                    _ => ("⏳", "Processing..."),
+                                };
+                                lines.push(Line::from(vec![
+                                    Span::styled(format!("  {} ", icon), Style::default()),
+                                    Span::styled(
+                                        phase_label,
+                                        Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
+                                    ),
+                                ]));
+                                lines.push(Line::from(""));
+                                // Progress bar
+                                let bar_width = 30;
+                                let filled = (pct * bar_width / 100).min(bar_width);
+                                let empty = bar_width - filled;
+                                lines.push(Line::from(vec![
+                                    Span::styled("  [", Style::default().fg(palette.border)),
+                                    Span::styled("█".repeat(filled), Style::default().fg(palette.accent)),
+                                    Span::styled("░".repeat(empty), Style::default().fg(palette.hint)),
+                                    Span::styled("]", Style::default().fg(palette.border)),
+                                    Span::styled(format!(" {}%", pct), Style::default().fg(palette.hint)),
+                                ]));
+                                lines.push(Line::from(""));
+                                lines.push(Line::from(Span::styled(
+                                    format!("  Processing {} of {} items", current, total),
+                                    Style::default().fg(palette.hint),
+                                )));
+                                lines.push(Line::from(Span::styled(
+                                    "  Search results will appear once indexing completes.",
+                                    Style::default().fg(palette.hint),
+                                )));
+                            }
+                            lines.push(Line::from(""));
                         }
-                    } else {
-                        // Check for fuzzy suggestion from query history
-                        let fuzzy = suggest_correction(&last_query, &query_history);
-                        // Use contextual empty state with helpful suggestions
-                        lines.extend(contextual_empty_state(
-                            &last_query,
-                            &filters,
-                            match_mode,
-                            palette,
-                            fuzzy.as_deref(),
-                        ));
+                    }
+
+                    // Only show history/empty state if not indexing OR if indexing but user typed a query
+                    let show_normal_empty = indexing_active.map(|(phase, _, _, _, _)| phase == 0).unwrap_or(true)
+                        || !query.trim().is_empty();
+
+                    if show_normal_empty {
+                        if query.trim().is_empty() && !query_history.is_empty() {
+                            lines.push(Line::from(Span::styled(
+                                "Recent queries (Enter to load):",
+                                palette.title(),
+                            )));
+                            for (idx, q) in query_history.iter().take(5).enumerate() {
+                                let selected = suggestion_idx == Some(idx);
+                                lines.push(Line::from(Span::styled(
+                                    format!("{} {}", if selected { "▶" } else { " " }, q),
+                                    if selected {
+                                        Style::default()
+                                            .fg(palette.accent)
+                                            .add_modifier(Modifier::BOLD)
+                                    } else {
+                                        Style::default().fg(palette.hint)
+                                    },
+                                )));
+                            }
+                        } else if !query.trim().is_empty() {
+                            // Check for fuzzy suggestion from query history
+                            let fuzzy = suggest_correction(&last_query, &query_history);
+                            // Use contextual empty state with helpful suggestions
+                            lines.extend(contextual_empty_state(
+                                &last_query,
+                                &filters,
+                                match_mode,
+                                palette,
+                                fuzzy.as_deref(),
+                            ));
+                        }
                     }
 
                     let block = Block::default().title("Results").borders(Borders::ALL);
@@ -1923,6 +2006,29 @@ pub fn run_tui(
                             1,
                         );
                         f.render_widget(Paragraph::new(indicator_span), indicator_area);
+                    }
+
+                    // Show "indexing in progress" warning when we have results but indexing is active
+                    if let Some(prog) = &progress {
+                        let (phase, _, _, _, pct) = get_indexing_state(prog);
+                        if phase > 0 {
+                            let indicator = format!(" ⚠ Indexing {}% - results may be incomplete ", pct);
+                            let indicator_span = Span::styled(
+                                indicator.clone(),
+                                Style::default()
+                                    .fg(palette.system)
+                                    .add_modifier(Modifier::BOLD),
+                            );
+                            // Render in top-right corner of results area
+                            let indicator_area = Rect::new(
+                                results_area.x
+                                    + results_area.width.saturating_sub(indicator.len() as u16 + 1),
+                                results_area.y,
+                                indicator.len() as u16,
+                                1,
+                            );
+                            f.render_widget(Paragraph::new(indicator_span), indicator_area);
+                        }
                     }
                 }
 
