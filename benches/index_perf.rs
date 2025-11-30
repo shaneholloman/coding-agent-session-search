@@ -19,6 +19,7 @@ fn bench_index_full(c: &mut Criterion) {
         full: true,
         force_rebuild: true,
         watch: false,
+        watch_once_paths: None,
         db_path,
         data_dir: data_dir.clone(),
         progress: None,
