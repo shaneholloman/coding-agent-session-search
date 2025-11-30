@@ -21,12 +21,124 @@ use rusqlite::Connection;
 
 use crate::search::tantivy::fields_from_schema;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SearchFilters {
     pub agents: HashSet<String>,
     pub workspaces: HashSet<String>,
     pub created_from: Option<i64>,
     pub created_to: Option<i64>,
+}
+
+/// Indicates how a search result matched the query.
+/// Used for ranking: exact matches rank higher than wildcard matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchType {
+    /// No wildcards - matched via exact term or edge n-gram prefix
+    #[default]
+    Exact,
+    /// Matched via trailing wildcard (foo*)
+    Prefix,
+    /// Matched via leading wildcard (*foo) - uses regex
+    Suffix,
+    /// Matched via both wildcards (*foo*) - uses regex
+    Substring,
+    /// Matched via automatic wildcard fallback when exact search was sparse
+    ImplicitWildcard,
+}
+
+impl MatchType {
+    /// Returns a quality factor for ranking (1.0 = best, lower = less precise match)
+    pub fn quality_factor(self) -> f32 {
+        match self {
+            MatchType::Exact => 1.0,
+            MatchType::Prefix => 0.9,
+            MatchType::Suffix => 0.8,
+            MatchType::Substring => 0.7,
+            MatchType::ImplicitWildcard => 0.6,
+        }
+    }
+}
+
+/// Type of suggestion for did-you-mean
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuggestionKind {
+    /// Typo correction (Levenshtein distance)
+    SpellingFix,
+    /// Try with wildcard prefix/suffix
+    WildcardQuery,
+    /// Remove restrictive filter
+    RemoveFilter,
+    /// Try different agent
+    AlternateAgent,
+    /// Broaden date range
+    BroaderDateRange,
+}
+
+/// A "did-you-mean" suggestion when search returns zero hits.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QuerySuggestion {
+    /// What kind of suggestion this is
+    pub kind: SuggestionKind,
+    /// Human-readable description (e.g., "Did you mean: 'codex'?")
+    pub message: String,
+    /// The suggested query string (if query change)
+    pub suggested_query: Option<String>,
+    /// Suggested filters to apply (replaces current filters if Some)
+    pub suggested_filters: Option<SearchFilters>,
+    /// Shortcut key (1, 2, or 3) for quick apply in TUI
+    pub shortcut: Option<u8>,
+}
+
+impl QuerySuggestion {
+    fn spelling(_query: &str, corrected: &str) -> Self {
+        Self {
+            kind: SuggestionKind::SpellingFix,
+            message: format!("Did you mean: \"{}\"?", corrected),
+            suggested_query: Some(corrected.to_string()),
+            suggested_filters: None,
+            shortcut: None,
+        }
+    }
+
+    fn wildcard(query: &str) -> Self {
+        let wildcard_query = format!("*{}*", query.trim_matches('*'));
+        Self {
+            kind: SuggestionKind::WildcardQuery,
+            message: format!("Try broader search: \"{}\"", wildcard_query),
+            suggested_query: Some(wildcard_query),
+            suggested_filters: None,
+            shortcut: None,
+        }
+    }
+
+    fn remove_agent_filter(current_agent: &str) -> Self {
+        Self {
+            kind: SuggestionKind::RemoveFilter,
+            message: format!("Remove agent filter (currently: {})", current_agent),
+            suggested_query: None,
+            suggested_filters: Some(SearchFilters::default()),
+            shortcut: None,
+        }
+    }
+
+    fn try_agent(agent_slug: &str) -> Self {
+        let mut filters = SearchFilters::default();
+        filters.agents.insert(agent_slug.to_string());
+        Self {
+            kind: SuggestionKind::AlternateAgent,
+            message: format!("Try searching in: {}", agent_slug),
+            suggested_query: None,
+            suggested_filters: Some(filters),
+            shortcut: None,
+        }
+    }
+
+    fn with_shortcut(mut self, key: u8) -> Self {
+        self.shortcut = Some(key);
+        self
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -41,6 +153,9 @@ pub struct SearchHit {
     pub created_at: Option<i64>,
     /// Line number in the source file where the matched message starts (1-indexed)
     pub line_number: Option<usize>,
+    /// How this result matched the query (exact, prefix wildcard, etc.)
+    #[serde(default)]
+    pub match_type: MatchType,
 }
 
 /// Result of a search operation with metadata about how matches were found
@@ -50,6 +165,10 @@ pub struct SearchResult {
     pub hits: Vec<SearchHit>,
     /// Whether wildcard fallback was used (query had no/few exact matches)
     pub wildcard_fallback: bool,
+    /// Cache metrics snapshot for observability/debug
+    pub cache_stats: CacheStats,
+    /// Did-you-mean suggestions when hits are empty or sparse
+    pub suggestions: Vec<QuerySuggestion>,
 }
 
 pub struct SearchClient {
@@ -64,6 +183,24 @@ pub struct SearchClient {
     // Shared for warm worker to read cache/filter logic; keep Arc to avoid clones of big data
     _shared_filters: Arc<Mutex<()>>, // placeholder lock to ensure Send/Sync; future warm prefill state
     metrics: Metrics,
+    cache_namespace: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub cache_hits: u64,
+    pub cache_miss: u64,
+    pub cache_shortfall: u64,
+    pub reloads: u64,
+    pub reload_ms_total: u128,
+    pub total_cap: usize,
+    pub total_cost: usize,
+    /// Total evictions since client creation
+    pub eviction_count: u64,
+    /// Approximate bytes used by cache (rough estimate)
+    pub approx_bytes: usize,
+    /// Byte cap if set (0 = no byte limit)
+    pub byte_cap: usize,
 }
 
 // Cache tuning: read from env to allow runtime override without recompiling.
@@ -75,6 +212,33 @@ static CACHE_SHARD_CAP: Lazy<usize> = Lazy::new(|| {
         .filter(|v| *v > 0)
         .unwrap_or(256)
 });
+
+// Total cache cost across all shards; approximate “~2k entries” default.
+static CACHE_TOTAL_CAP: Lazy<usize> = Lazy::new(|| {
+    std::env::var("CASS_CACHE_TOTAL_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(2048)
+});
+
+static CACHE_DEBUG_ENABLED: Lazy<bool> = Lazy::new(|| {
+    std::env::var("CASS_DEBUG_CACHE_METRICS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+});
+
+// Optional byte-based cap for cache memory; 0 means no byte limit (entry-based only).
+// Approximate sizing: ~500 bytes per cached hit typical (content/title/snippets).
+// Example: CASS_CACHE_BYTE_CAP=10485760 for ~10MB limit.
+static CACHE_BYTE_CAP: Lazy<usize> = Lazy::new(|| {
+    std::env::var("CASS_CACHE_BYTE_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0) // 0 = disabled (entry-based cap only)
+});
+
+const CACHE_KEY_VERSION: &str = "1";
 
 // Warm debounce (ms) for background reload/warm jobs; default 120ms.
 static WARM_DEBOUNCE_MS: Lazy<u64> = Lazy::new(|| {
@@ -94,12 +258,51 @@ struct CachedHit {
     bloom64: u64,
 }
 
-#[derive(Default)]
+impl CachedHit {
+    /// Approximate byte size of this cached hit (rough estimate for memory guardrails).
+    /// Includes SearchHit strings + lowercase copies + bloom filter.
+    fn approx_bytes(&self) -> usize {
+        // Base struct overhead
+        let base = std::mem::size_of::<Self>();
+        // SearchHit string fields (title, snippet, content, source_path, agent, workspace)
+        let hit_strings = self.hit.title.len()
+            + self.hit.snippet.len()
+            + self.hit.content.len()
+            + self.hit.source_path.len()
+            + self.hit.agent.len()
+            + self.hit.workspace.len();
+        // Lowercase cache copies
+        let lc_strings = self.lc_content.len()
+            + self.lc_title.as_ref().map(|s| s.len()).unwrap_or(0)
+            + self.lc_snippet.len();
+        base + hit_strings + lc_strings
+    }
+}
+
 struct CacheShards {
     shards: HashMap<String, LruCache<String, Vec<CachedHit>>>,
+    total_cap: usize,
+    total_cost: usize,
+    /// Running count of evictions (for diagnostics)
+    eviction_count: u64,
+    /// Approximate bytes used by all cached hits
+    total_bytes: usize,
+    /// Byte cap (0 = disabled)
+    byte_cap: usize,
 }
 
 impl CacheShards {
+    fn new(total_cap: usize, byte_cap: usize) -> Self {
+        Self {
+            shards: HashMap::new(),
+            total_cap: total_cap.max(1),
+            total_cost: 0,
+            eviction_count: 0,
+            total_bytes: 0,
+            byte_cap,
+        }
+    }
+
     fn shard_mut(&mut self, name: &str) -> &mut LruCache<String, Vec<CachedHit>> {
         self.shards
             .entry(name.to_string())
@@ -108,6 +311,75 @@ impl CacheShards {
 
     fn shard_opt(&self, name: &str) -> Option<&LruCache<String, Vec<CachedHit>>> {
         self.shards.get(name)
+    }
+
+    fn put(&mut self, shard_name: &str, key: String, value: Vec<CachedHit>) {
+        let shard = self.shard_mut(shard_name);
+        let new_cost = value.len();
+        let new_bytes: usize = value.iter().map(|h| h.approx_bytes()).sum();
+        // Subtract old entry's cost/bytes if replacing
+        let (old_cost, old_bytes) = shard
+            .get(&key)
+            .map(|v| (v.len(), v.iter().map(|h| h.approx_bytes()).sum()))
+            .unwrap_or((0, 0));
+        shard.put(key, value);
+        self.total_cost += new_cost.saturating_sub(old_cost);
+        self.total_bytes += new_bytes.saturating_sub(old_bytes);
+        self.evict_until_within_cap();
+    }
+
+    fn evict_until_within_cap(&mut self) {
+        // Evict if over entry cap OR over byte cap (when byte_cap > 0)
+        while self.total_cost > self.total_cap
+            || (self.byte_cap > 0 && self.total_bytes > self.byte_cap)
+        {
+            let mut evicted = false;
+            for shard in self.shards.values_mut() {
+                if let Some((_k, v)) = shard.pop_lru() {
+                    let evicted_bytes: usize = v.iter().map(|h| h.approx_bytes()).sum();
+                    self.total_cost = self.total_cost.saturating_sub(v.len());
+                    self.total_bytes = self.total_bytes.saturating_sub(evicted_bytes);
+                    self.eviction_count += 1;
+                    evicted = true;
+                    // Check if we're back within both caps
+                    let within_cost = self.total_cost <= self.total_cap;
+                    let within_bytes = self.byte_cap == 0 || self.total_bytes <= self.byte_cap;
+                    if within_cost && within_bytes {
+                        break;
+                    }
+                }
+            }
+            if !evicted {
+                break;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.shards.clear();
+        self.total_cost = 0;
+        self.total_bytes = 0;
+        // Note: eviction_count preserved for lifetime stats
+    }
+
+    fn total_cost(&self) -> usize {
+        self.total_cost
+    }
+
+    fn total_cap(&self) -> usize {
+        self.total_cap
+    }
+
+    fn eviction_count(&self) -> u64 {
+        self.eviction_count
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    fn byte_cap(&self) -> usize {
+        self.byte_cap
     }
 }
 
@@ -141,6 +413,39 @@ fn sanitize_query(raw: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Calculate Levenshtein edit distance between two strings.
+/// Used for typo detection in did-you-mean suggestions.
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let a_len = a_chars.len();
+    let b_len = b_chars.len();
+
+    if a_len == 0 {
+        return b_len;
+    }
+    if b_len == 0 {
+        return a_len;
+    }
+
+    // Use two rows for space efficiency
+    let mut prev_row: Vec<usize> = (0..=b_len).collect();
+    let mut curr_row: Vec<usize> = vec![0; b_len + 1];
+
+    for (i, a_char) in a_chars.iter().enumerate() {
+        curr_row[0] = i + 1;
+        for (j, b_char) in b_chars.iter().enumerate() {
+            let cost = if a_char == b_char { 0 } else { 1 };
+            curr_row[j + 1] = (prev_row[j + 1] + 1) // deletion
+                .min(curr_row[j] + 1) // insertion
+                .min(prev_row[j] + cost); // substitution
+        }
+        std::mem::swap(&mut prev_row, &mut curr_row);
+    }
+
+    prev_row[b_len]
 }
 
 /// Escape special regex characters in a string
@@ -197,6 +502,255 @@ impl WildcardPattern {
             _ => None,
         }
     }
+
+    /// Convert to the corresponding public MatchType
+    fn to_match_type(&self) -> MatchType {
+        match self {
+            WildcardPattern::Exact(_) => MatchType::Exact,
+            WildcardPattern::Prefix(_) => MatchType::Prefix,
+            WildcardPattern::Suffix(_) => MatchType::Suffix,
+            WildcardPattern::Substring(_) => MatchType::Substring,
+        }
+    }
+}
+
+/// Token types for boolean query parsing
+#[derive(Debug, Clone, PartialEq)]
+enum QueryToken {
+    /// A search term (may include wildcards)
+    Term(String),
+    /// Quoted phrase for exact matching
+    Phrase(String),
+    /// AND operator (explicit)
+    And,
+    /// OR operator
+    Or,
+    /// NOT operator (next term is excluded)
+    Not,
+}
+
+/// Parse a query string into boolean tokens.
+/// Supports:
+/// - AND, && for explicit AND (implicit between terms)
+/// - OR, || for OR
+/// - NOT, - prefix for exclusion
+/// - "quoted phrases" for exact matching
+fn parse_boolean_query(query: &str) -> Vec<QueryToken> {
+    let mut tokens = Vec::new();
+    let mut chars = query.chars().peekable();
+    let mut current_word = String::new();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                // Flush any pending word
+                if !current_word.is_empty() {
+                    tokens.push(QueryToken::Term(std::mem::take(&mut current_word)));
+                }
+                // Collect quoted phrase
+                let mut phrase = String::new();
+                while let Some(&next) = chars.peek() {
+                    if next == '"' {
+                        chars.next();
+                        break;
+                    }
+                    phrase.push(chars.next().unwrap());
+                }
+                if !phrase.is_empty() {
+                    tokens.push(QueryToken::Phrase(phrase));
+                }
+            }
+            '&' if chars.peek() == Some(&'&') => {
+                chars.next(); // consume second &
+                if !current_word.is_empty() {
+                    tokens.push(QueryToken::Term(std::mem::take(&mut current_word)));
+                }
+                tokens.push(QueryToken::And);
+            }
+            '|' if chars.peek() == Some(&'|') => {
+                chars.next(); // consume second |
+                if !current_word.is_empty() {
+                    tokens.push(QueryToken::Term(std::mem::take(&mut current_word)));
+                }
+                tokens.push(QueryToken::Or);
+            }
+            '-' if current_word.is_empty() => {
+                // Prefix minus for NOT (at start of a term)
+                // Works at query start: "-foo" or mid-query: "bar -foo"
+                tokens.push(QueryToken::Not);
+            }
+            ' ' | '\t' | '\n' => {
+                if !current_word.is_empty() {
+                    let word = std::mem::take(&mut current_word);
+                    let upper = word.to_uppercase();
+                    match upper.as_str() {
+                        "AND" => tokens.push(QueryToken::And),
+                        "OR" => tokens.push(QueryToken::Or),
+                        "NOT" => tokens.push(QueryToken::Not),
+                        _ => tokens.push(QueryToken::Term(word)),
+                    }
+                }
+            }
+            _ => {
+                current_word.push(c);
+            }
+        }
+    }
+
+    // Flush final word
+    if !current_word.is_empty() {
+        let upper = current_word.to_uppercase();
+        match upper.as_str() {
+            "AND" => tokens.push(QueryToken::And),
+            "OR" => tokens.push(QueryToken::Or),
+            "NOT" => tokens.push(QueryToken::Not),
+            _ => tokens.push(QueryToken::Term(current_word)),
+        }
+    }
+
+    tokens
+}
+
+/// Check if a query string contains boolean operators
+fn has_boolean_operators(query: &str) -> bool {
+    let tokens = parse_boolean_query(query);
+    tokens.iter().any(|t| {
+        matches!(
+            t,
+            QueryToken::And | QueryToken::Or | QueryToken::Not | QueryToken::Phrase(_)
+        )
+    })
+}
+
+/// Build Tantivy query clauses from boolean tokens.
+/// Returns clauses for use in a BooleanQuery.
+fn build_boolean_query_clauses(
+    tokens: &[QueryToken],
+    fields: &crate::search::tantivy::Fields,
+) -> Vec<(Occur, Box<dyn Query>)> {
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+    let mut pending_or_group: Vec<Box<dyn Query>> = Vec::new();
+    let mut next_occur = Occur::Must;
+    let mut in_or_sequence = false;
+
+    for token in tokens {
+        match token {
+            QueryToken::And => {
+                // Flush any OR group
+                if !pending_or_group.is_empty() {
+                    let or_clauses: Vec<_> = pending_or_group
+                        .drain(..)
+                        .map(|q| (Occur::Should, q))
+                        .collect();
+                    clauses.push((Occur::Must, Box::new(BooleanQuery::new(or_clauses))));
+                }
+                in_or_sequence = false;
+                next_occur = Occur::Must;
+            }
+            QueryToken::Or => {
+                in_or_sequence = true;
+                // Don't change next_occur; OR will group with previous term
+            }
+            QueryToken::Not => {
+                // Flush any OR group
+                if !pending_or_group.is_empty() {
+                    let or_clauses: Vec<_> = pending_or_group
+                        .drain(..)
+                        .map(|q| (Occur::Should, q))
+                        .collect();
+                    clauses.push((Occur::Must, Box::new(BooleanQuery::new(or_clauses))));
+                }
+                in_or_sequence = false;
+                next_occur = Occur::MustNot;
+            }
+            QueryToken::Term(term) => {
+                let pattern = WildcardPattern::parse(term);
+                let term_shoulds = build_term_query_clauses(&pattern, fields);
+                if term_shoulds.is_empty() {
+                    continue;
+                }
+                let term_query: Box<dyn Query> = Box::new(BooleanQuery::new(term_shoulds));
+
+                if in_or_sequence || next_occur == Occur::Should {
+                    // Add to OR group
+                    if pending_or_group.is_empty() {
+                        // Pull last Must clause into OR group if exists
+                        if let Some((Occur::Must, last_q)) = clauses.pop() {
+                            pending_or_group.push(last_q);
+                        }
+                    }
+                    pending_or_group.push(term_query);
+                    in_or_sequence = true; // Continue OR sequence
+                } else {
+                    clauses.push((next_occur, term_query));
+                }
+                next_occur = Occur::Must; // Reset for next term
+            }
+            QueryToken::Phrase(phrase) => {
+                // For phrases, search all words as MUST within the phrase
+                let words: Vec<&str> = phrase.split_whitespace().collect();
+                if words.is_empty() {
+                    continue;
+                }
+                let mut phrase_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+                for word in words {
+                    let pattern = WildcardPattern::parse(word);
+                    let term_shoulds = build_term_query_clauses(&pattern, fields);
+                    if !term_shoulds.is_empty() {
+                        phrase_clauses
+                            .push((Occur::Must, Box::new(BooleanQuery::new(term_shoulds))));
+                    }
+                }
+                if phrase_clauses.is_empty() {
+                    continue;
+                }
+                let phrase_query: Box<dyn Query> = Box::new(BooleanQuery::new(phrase_clauses));
+
+                if in_or_sequence {
+                    if pending_or_group.is_empty()
+                        && let Some((Occur::Must, last_q)) = clauses.pop()
+                    {
+                        pending_or_group.push(last_q);
+                    }
+                    pending_or_group.push(phrase_query);
+                } else {
+                    clauses.push((next_occur, phrase_query));
+                }
+                next_occur = Occur::Must;
+            }
+        }
+    }
+
+    // Flush any remaining OR group
+    if !pending_or_group.is_empty() {
+        let or_clauses: Vec<_> = pending_or_group
+            .drain(..)
+            .map(|q| (Occur::Should, q))
+            .collect();
+        clauses.push((Occur::Must, Box::new(BooleanQuery::new(or_clauses))));
+    }
+
+    clauses
+}
+
+/// Determine the dominant match type from a query string.
+/// Returns the "loosest" pattern used (Substring > Suffix > Prefix > Exact).
+fn dominant_match_type(query: &str) -> MatchType {
+    let terms: Vec<&str> = query.split_whitespace().collect();
+    if terms.is_empty() {
+        return MatchType::Exact;
+    }
+
+    let mut worst = MatchType::Exact;
+    for term in terms {
+        let pattern = WildcardPattern::parse(term);
+        let mt = pattern.to_match_type();
+        // Lower quality factor = "looser" match = dominant
+        if mt.quality_factor() < worst.quality_factor() {
+            worst = mt;
+        }
+    }
+    worst
 }
 
 /// Build query clauses for a single term based on its wildcard pattern.
@@ -339,6 +893,11 @@ impl SearchClient {
         let shared_filters = Arc::new(Mutex::new(()));
         let reload_epoch = Arc::new(AtomicU64::new(0));
         let metrics = Metrics::default();
+        let cache_namespace = format!(
+            "v{}|schema:{}",
+            CACHE_KEY_VERSION,
+            crate::search::tantivy::SCHEMA_HASH
+        );
 
         let warm_pair = if let Some((reader, fields)) = &tantivy {
             maybe_spawn_warm_worker(
@@ -355,7 +914,7 @@ impl SearchClient {
         Ok(Some(Self {
             reader: tantivy,
             sqlite,
-            prefix_cache: Mutex::new(CacheShards::default()),
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch,
@@ -363,6 +922,7 @@ impl SearchClient {
             _warm_handle: warm_pair.map(|(_, h)| h),
             _shared_filters: shared_filters,
             metrics,
+            cache_namespace,
         }))
     }
 
@@ -396,11 +956,14 @@ impl SearchClient {
                 if filtered.len() >= limit {
                     filtered.truncate(limit);
                     self.metrics.inc_cache_hits();
+                    self.maybe_log_cache_metrics("hit");
                     return Ok(filtered);
                 }
                 self.metrics.inc_cache_shortfall();
+                self.maybe_log_cache_metrics("shortfall");
             }
             self.metrics.inc_cache_miss();
+            self.maybe_log_cache_metrics("miss");
         }
 
         // Tantivy is the primary high-performance engine.
@@ -434,7 +997,13 @@ impl SearchClient {
         }
 
         // Fallback: SQLite FTS (slower, but strictly consistent with DB)
+        // Skip SQLite fallback when the query contains leading/trailing wildcards that
+        // FTS5 cannot parse (e.g., "*handler" or "*foo*"), to avoid "unknown special query" errors.
+        let query_has_wildcards = sanitized.contains('*');
         if let Some(conn) = &self.sqlite {
+            if query_has_wildcards {
+                return Ok(Vec::new());
+            }
             tracing::info!(
                 backend = "sqlite",
                 query = sanitized,
@@ -466,6 +1035,7 @@ impl SearchClient {
     ) -> Result<SearchResult> {
         // First, try the normal search
         let hits = self.search(query, filters.clone(), limit, offset)?;
+        let baseline_stats = self.cache_stats();
 
         // Check if we should try wildcard fallback
         let query_has_wildcards = query.contains('*');
@@ -473,9 +1043,17 @@ impl SearchClient {
 
         if !is_sparse || query_has_wildcards || query.trim().is_empty() {
             // Either we have enough results, query already has wildcards, or query is empty
+            // Generate suggestions only if truly zero hits
+            let suggestions = if hits.is_empty() && !query.trim().is_empty() {
+                self.generate_suggestions(query, &filters)
+            } else {
+                Vec::new()
+            };
             return Ok(SearchResult {
                 hits,
                 wildcard_fallback: false,
+                cache_stats: baseline_stats,
+                suggestions,
             });
         }
 
@@ -493,21 +1071,105 @@ impl SearchClient {
             "wildcard_fallback"
         );
 
-        let fallback_hits = self.search(&wildcard_query, filters, limit, offset)?;
+        let mut fallback_hits = self.search(&wildcard_query, filters.clone(), limit, offset)?;
+        let fallback_stats = self.cache_stats();
 
         // Use fallback results if they're better
         if fallback_hits.len() > hits.len() {
+            // Mark all hits as ImplicitWildcard since we auto-added wildcards
+            for hit in &mut fallback_hits {
+                hit.match_type = MatchType::ImplicitWildcard;
+            }
+            // Generate suggestions if still zero hits after fallback
+            let suggestions = if fallback_hits.is_empty() {
+                self.generate_suggestions(query, &filters)
+            } else {
+                Vec::new()
+            };
             Ok(SearchResult {
                 hits: fallback_hits,
                 wildcard_fallback: true,
+                cache_stats: fallback_stats,
+                suggestions,
             })
         } else {
             // Keep original results even if sparse
+            // Generate suggestions if zero hits
+            let suggestions = if hits.is_empty() {
+                self.generate_suggestions(query, &filters)
+            } else {
+                Vec::new()
+            };
             Ok(SearchResult {
                 hits,
                 wildcard_fallback: false,
+                cache_stats: baseline_stats,
+                suggestions,
             })
         }
+    }
+
+    /// Generate "did-you-mean" suggestions for zero-hit queries.
+    fn generate_suggestions(&self, query: &str, filters: &SearchFilters) -> Vec<QuerySuggestion> {
+        let mut suggestions = Vec::new();
+        let query_lower = query.to_lowercase();
+
+        // 1. Suggest wildcard search if query doesn't have wildcards
+        if !query.contains('*') && query.len() >= 2 {
+            suggestions.push(QuerySuggestion::wildcard(query).with_shortcut(1));
+        }
+
+        // 2. Suggest removing agent filter if one is set
+        if !filters.agents.is_empty() {
+            let agents: Vec<&str> = filters.agents.iter().map(|s| s.as_str()).collect();
+            let agent_str = agents.join(", ");
+            suggestions.push(QuerySuggestion::remove_agent_filter(&agent_str).with_shortcut(2));
+        }
+
+        // 3. Suggest common agent names if query looks like a typo of one
+        let known_agents = [
+            "codex",
+            "claude",
+            "claude_code",
+            "cline",
+            "gemini",
+            "amp",
+            "opencode",
+        ];
+        for agent in &known_agents {
+            if levenshtein_distance(&query_lower, agent) <= 2 && query_lower != *agent {
+                suggestions.push(
+                    QuerySuggestion::spelling(query, agent)
+                        .with_shortcut(suggestions.len().min(2) as u8 + 1),
+                );
+                break; // Only suggest one spelling fix
+            }
+        }
+
+        // 4. Suggest alternative agents if we have SQLite connection and no agent filter
+        if filters.agents.is_empty()
+            && let Some(ref conn) = self.sqlite
+            && let Ok(mut stmt) = conn
+                .prepare("SELECT DISTINCT agent_slug FROM conversations ORDER BY id DESC LIMIT 3")
+            && let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0))
+        {
+            for row in rows.flatten() {
+                if suggestions.len() < 3 {
+                    suggestions.push(
+                        QuerySuggestion::try_agent(&row)
+                            .with_shortcut(suggestions.len().min(2) as u8 + 1),
+                    );
+                }
+            }
+        }
+
+        // Ensure we have at most 3 suggestions with shortcuts 1, 2, 3
+        suggestions.truncate(3);
+        for (i, sugg) in suggestions.iter_mut().enumerate() {
+            sugg.shortcut = Some((i + 1) as u8);
+        }
+
+        suggestions
     }
 
     fn searcher_for_thread(&self, reader: &IndexReader) -> Searcher {
@@ -534,7 +1196,7 @@ impl SearchClient {
             && prev != generation
             && let Ok(mut cache) = self.prefix_cache.lock()
         {
-            cache.shards.clear();
+            cache.clear();
         }
         *guard = Some(generation);
     }
@@ -554,21 +1216,26 @@ impl SearchClient {
 
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
-        // Manual query construction for "search-as-you-type" with wildcard support.
-        // We treat each whitespace-separated token as a MUST clause.
-        // Each token matches if it appears in title OR content OR their prefix variants.
-        // Wildcard patterns (*foo, foo*, *foo*) are converted to regex queries.
-        let terms: Vec<&str> = query.split_whitespace().collect();
-        if !terms.is_empty() {
-            for term_str in terms {
-                let pattern = WildcardPattern::parse(term_str);
-                let term_shoulds = build_term_query_clauses(&pattern, fields);
-                if !term_shoulds.is_empty() {
-                    clauses.push((Occur::Must, Box::new(BooleanQuery::new(term_shoulds))));
+        // Parse query with boolean operator support (AND, OR, NOT, "phrases")
+        // Falls back to simple whitespace split for plain queries (implicit AND)
+        let tokens = parse_boolean_query(query);
+        if tokens.is_empty() {
+            clauses.push((Occur::Must, Box::new(AllQuery)));
+        } else if has_boolean_operators(query) {
+            // Use boolean query builder for complex queries
+            let bool_clauses = build_boolean_query_clauses(&tokens, fields);
+            clauses.extend(bool_clauses);
+        } else {
+            // Simple query: treat each term as MUST (implicit AND)
+            for token in tokens {
+                if let QueryToken::Term(term_str) = token {
+                    let pattern = WildcardPattern::parse(&term_str);
+                    let term_shoulds = build_term_query_clauses(&pattern, fields);
+                    if !term_shoulds.is_empty() {
+                        clauses.push((Occur::Must, Box::new(BooleanQuery::new(term_shoulds))));
+                    }
                 }
             }
-        } else {
-            clauses.push((Occur::Must, Box::new(AllQuery)));
         }
 
         if !filters.agents.is_empty() {
@@ -635,6 +1302,8 @@ impl SearchClient {
         };
 
         let top_docs = searcher.search(&q, &TopDocs::with_limit(limit).and_offset(offset))?;
+        // Compute match type once for all results (not per-hit)
+        let query_match_type = dominant_match_type(query);
         let mut hits = Vec::new();
         for (score, addr) in top_docs {
             let doc: TantivyDocument = searcher.doc(addr)?;
@@ -686,6 +1355,7 @@ impl SearchClient {
                 workspace,
                 created_at,
                 line_number: None, // TODO: populate from index if stored
+                match_type: query_match_type,
             });
         }
         Ok(hits)
@@ -703,6 +1373,8 @@ impl SearchClient {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
+        // Compute match type once for all results
+        let query_match_type = dominant_match_type(query);
         let mut sql = String::from(
             "SELECT f.title, f.content, f.agent, f.workspace, f.source_path, f.created_at, bm25(fts_messages) AS score, snippet(fts_messages, 0, '**', '**', '...', 64) AS snippet, m.idx
              FROM fts_messages f
@@ -771,6 +1443,7 @@ impl SearchClient {
                     workspace,
                     created_at,
                     line_number,
+                    match_type: query_match_type,
                 })
             },
         )?;
@@ -808,6 +1481,16 @@ impl Metrics {
     fn record_reload(&self, duration: Duration) {
         self.inc_reload();
         *self.reload_ms_total.lock().unwrap() += duration.as_millis();
+    }
+
+    fn snapshot_all(&self) -> (u64, u64, u64, u64, u128) {
+        (
+            *self.cache_hits.lock().unwrap(),
+            *self.cache_miss.lock().unwrap(),
+            *self.cache_shortfall.lock().unwrap(),
+            *self.reloads.lock().unwrap(),
+            *self.reload_ms_total.lock().unwrap(),
+        )
     }
 
     #[cfg(test)]
@@ -1060,8 +1743,34 @@ impl SearchClient {
         Ok(())
     }
 
+    fn maybe_log_cache_metrics(&self, event: &str) {
+        if !*CACHE_DEBUG_ENABLED {
+            return;
+        }
+        let stats = self.cache_stats();
+        tracing::debug!(
+            event,
+            hits = stats.cache_hits,
+            miss = stats.cache_miss,
+            shortfall = stats.cache_shortfall,
+            reloads = stats.reloads,
+            reload_ms_total = stats.reload_ms_total,
+            total_cap = stats.total_cap,
+            total_cost = stats.total_cost,
+            evictions = stats.eviction_count,
+            approx_bytes = stats.approx_bytes,
+            byte_cap = stats.byte_cap,
+            "cache_metrics"
+        );
+    }
+
     fn cache_key(&self, query: &str, filters: &SearchFilters) -> String {
-        format!("{query}::{}", filters_fingerprint(filters))
+        format!(
+            "{}|{}::{}",
+            self.cache_namespace,
+            query,
+            filters_fingerprint(filters)
+        )
     }
 
     fn shard_name(&self, filters: &SearchFilters) -> String {
@@ -1106,9 +1815,36 @@ impl SearchClient {
         if let Ok(mut cache) = self.prefix_cache.lock() {
             let shard_name = self.shard_name(filters);
             let key = self.cache_key(query, filters);
-            let shard = cache.shard_mut(&shard_name);
             let cached_hits: Vec<CachedHit> = hits.iter().map(cached_hit_from).collect();
-            shard.put(key, cached_hits);
+            cache.put(&shard_name, key, cached_hits);
+        }
+    }
+
+    pub fn cache_stats(&self) -> CacheStats {
+        let (hits, miss, shortfall, reloads, reload_ms_total) = self.metrics.snapshot_all();
+        let (total_cap, total_cost, eviction_count, approx_bytes, byte_cap) =
+            if let Ok(cache) = self.prefix_cache.lock() {
+                (
+                    cache.total_cap(),
+                    cache.total_cost(),
+                    cache.eviction_count(),
+                    cache.total_bytes(),
+                    cache.byte_cap(),
+                )
+            } else {
+                (0, 0, 0, 0, 0)
+            };
+        CacheStats {
+            cache_hits: hits,
+            cache_miss: miss,
+            cache_shortfall: shortfall,
+            reloads,
+            reload_ms_total,
+            total_cap,
+            total_cost,
+            eviction_count,
+            approx_bytes,
+            byte_cap,
         }
     }
 }
@@ -1125,7 +1861,7 @@ mod tests {
         let client = SearchClient {
             reader: None,
             sqlite: None,
-            prefix_cache: Mutex::new(CacheShards::default()),
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -1133,6 +1869,7 @@ mod tests {
             _warm_handle: None,
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
+            cache_namespace: format!("v{}|schema:test", CACHE_KEY_VERSION),
         };
 
         let hits = vec![SearchHit {
@@ -1145,6 +1882,7 @@ mod tests {
             workspace: "w".into(),
             created_at: None,
             line_number: None,
+            match_type: MatchType::Exact,
         }];
 
         client.put_cache("こん", &SearchFilters::default(), &hits);
@@ -1168,6 +1906,7 @@ mod tests {
             workspace: "w".into(),
             created_at: None,
             line_number: None,
+            match_type: MatchType::Exact,
         };
         let cached = cached_hit_from(&hit);
         assert!(hit_matches_query_cached(&cached, "hello"));
@@ -1494,6 +2233,115 @@ mod tests {
     }
 
     #[test]
+    fn search_sets_match_type_for_wildcards() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
+        let conv = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("handlers".into()),
+            workspace: None,
+            source_path: dir.path().join("h.jsonl"),
+            started_at: Some(1),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(1),
+                content: "the request handler delegates".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+            }],
+        };
+        index.add_conversation(&conv)?;
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+
+        let exact = client.search("handler", SearchFilters::default(), 10, 0)?;
+        assert_eq!(exact[0].match_type, MatchType::Exact);
+
+        let prefix = client.search("hand*", SearchFilters::default(), 10, 0)?;
+        assert_eq!(prefix[0].match_type, MatchType::Prefix);
+
+        let suffix = client.search("*handler", SearchFilters::default(), 10, 0)?;
+        assert_eq!(suffix[0].match_type, MatchType::Suffix);
+
+        let substring = client.search("*andle*", SearchFilters::default(), 10, 0)?;
+        assert_eq!(substring[0].match_type, MatchType::Substring);
+
+        Ok(())
+    }
+
+    #[test]
+    fn search_with_fallback_marks_implicit_wildcard() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
+        let conv = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("handlers".into()),
+            workspace: None,
+            source_path: dir.path().join("h2.jsonl"),
+            started_at: Some(1),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(1),
+                content: "the request handler delegates".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+            }],
+        };
+        index.add_conversation(&conv)?;
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+
+        // Base search for "andle" finds nothing; fallback "*andle*" should hit and mark implicit.
+        let result = client.search_with_fallback("andle", SearchFilters::default(), 10, 0, 2)?;
+        assert!(result.wildcard_fallback);
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].match_type, MatchType::ImplicitWildcard);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_skips_wildcard_queries() -> Result<()> {
+        // Build a client with SQLite only; wildcard queries should short-circuit without errors.
+        let conn = Connection::open_in_memory()?;
+        let client = SearchClient {
+            reader: None,
+            sqlite: Some(conn),
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{}|schema:test", CACHE_KEY_VERSION),
+        };
+
+        let hits = client.search("*handler", SearchFilters::default(), 5, 0)?;
+        assert!(
+            hits.is_empty(),
+            "wildcard should skip sqlite fallback, not error"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn cache_invalidates_on_new_data() -> Result<()> {
         let dir = TempDir::new()?;
         let mut index = TantivyIndex::open_or_create(dir.path())?;
@@ -1587,7 +2435,7 @@ mod tests {
         let client = SearchClient {
             reader: None,
             sqlite: None,
-            prefix_cache: Mutex::new(CacheShards::default()),
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -1595,6 +2443,7 @@ mod tests {
             _warm_handle: None,
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
+            cache_namespace: format!("v{}|schema:test", CACHE_KEY_VERSION),
         };
 
         let hit = SearchHit {
@@ -1607,6 +2456,7 @@ mod tests {
             workspace: "w".into(),
             created_at: None,
             line_number: None,
+            match_type: MatchType::Exact,
         };
         let hits = vec![hit];
 
@@ -1627,5 +2477,1298 @@ mod tests {
             let cache = client.prefix_cache.lock().unwrap();
             assert!(cache.shards.is_empty());
         }
+    }
+
+    #[test]
+    fn cache_total_cap_evicts_across_shards() {
+        let client = SearchClient {
+            reader: None,
+            sqlite: None,
+            prefix_cache: Mutex::new(CacheShards::new(2, 0)), // tiny entry cap, no byte cap
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{}|schema:test", CACHE_KEY_VERSION),
+        };
+
+        let hit = SearchHit {
+            title: "a".into(),
+            snippet: "a".into(),
+            content: "a".into(),
+            score: 1.0,
+            source_path: "p".into(),
+            agent: "agent1".into(),
+            workspace: "w".into(),
+            created_at: None,
+            line_number: None,
+            match_type: MatchType::Exact,
+        };
+        let hits = vec![hit.clone()];
+
+        let mut filters = SearchFilters::default();
+        filters.agents.insert("agent1".into());
+        client.put_cache("a", &filters, &hits);
+        filters.agents.clear();
+        filters.agents.insert("agent2".into());
+        client.put_cache("b", &filters, &hits);
+        filters.agents.clear();
+        filters.agents.insert("agent3".into());
+        client.put_cache("c", &filters, &hits);
+
+        let stats = client.cache_stats();
+        assert!(stats.total_cost <= stats.total_cap);
+        assert_eq!(stats.total_cap, 2);
+    }
+
+    #[test]
+    fn cache_stats_reflect_metrics() {
+        let client = SearchClient {
+            reader: None,
+            sqlite: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{}|schema:test", CACHE_KEY_VERSION),
+        };
+
+        client.metrics.inc_cache_hits();
+        client.metrics.inc_cache_miss();
+        client.metrics.inc_cache_shortfall();
+        client.metrics.record_reload(Duration::from_millis(10));
+
+        let stats = client.cache_stats();
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.cache_miss, 1);
+        assert_eq!(stats.cache_shortfall, 1);
+        assert_eq!(stats.reloads, 1);
+        assert_eq!(stats.reload_ms_total, 10);
+        assert_eq!(stats.total_cap, *CACHE_TOTAL_CAP);
+    }
+
+    #[test]
+    fn cache_eviction_count_tracks_evictions() {
+        // tiny entry cap (2 entries), no byte cap - forces evictions
+        let client = SearchClient {
+            reader: None,
+            sqlite: None,
+            prefix_cache: Mutex::new(CacheShards::new(2, 0)),
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{}|schema:test", CACHE_KEY_VERSION),
+        };
+
+        let hit = SearchHit {
+            title: "test".into(),
+            snippet: "snippet".into(),
+            content: "content".into(),
+            score: 1.0,
+            source_path: "p".into(),
+            agent: "a".into(),
+            workspace: "w".into(),
+            created_at: None,
+            line_number: None,
+            match_type: MatchType::Exact,
+        };
+
+        // Put 3 entries - should trigger 1 eviction (cap is 2)
+        client.put_cache(
+            "query1",
+            &SearchFilters::default(),
+            std::slice::from_ref(&hit),
+        );
+        client.put_cache(
+            "query2",
+            &SearchFilters::default(),
+            std::slice::from_ref(&hit),
+        );
+        client.put_cache(
+            "query3",
+            &SearchFilters::default(),
+            std::slice::from_ref(&hit),
+        );
+
+        let stats = client.cache_stats();
+        assert!(
+            stats.eviction_count >= 1,
+            "should have evicted at least 1 entry"
+        );
+        assert!(stats.total_cost <= 2, "should be at or below cap");
+        assert!(stats.approx_bytes > 0, "should track bytes used");
+    }
+
+    #[test]
+    fn cache_byte_cap_triggers_eviction() {
+        // Large entry cap (1000), tiny byte cap (100 bytes) - forces byte-based evictions
+        let client = SearchClient {
+            reader: None,
+            sqlite: None,
+            prefix_cache: Mutex::new(CacheShards::new(1000, 100)), // byte cap of 100
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{}|schema:test", CACHE_KEY_VERSION),
+        };
+
+        // Large content to exceed byte cap quickly
+        let hit = SearchHit {
+            title: "a".repeat(50),
+            snippet: "b".repeat(50),
+            content: "c".repeat(100), // 200+ bytes per hit
+            score: 1.0,
+            source_path: "p".into(),
+            agent: "a".into(),
+            workspace: "w".into(),
+            created_at: None,
+            line_number: None,
+            match_type: MatchType::Exact,
+        };
+
+        // Put 3 large entries - should trigger byte-based evictions
+        client.put_cache("q1", &SearchFilters::default(), std::slice::from_ref(&hit));
+        client.put_cache("q2", &SearchFilters::default(), std::slice::from_ref(&hit));
+        client.put_cache("q3", &SearchFilters::default(), std::slice::from_ref(&hit));
+
+        let stats = client.cache_stats();
+        assert!(
+            stats.eviction_count >= 1,
+            "byte cap should trigger evictions"
+        );
+        assert_eq!(stats.byte_cap, 100, "byte cap should be reported");
+        // Note: approx_bytes may briefly exceed cap during put, but eviction brings it down
+    }
+
+    // ============================================================
+    // Phase 7 Tests: WildcardPattern, escape_regex, fallback, dedup
+    // ============================================================
+
+    #[test]
+    fn wildcard_pattern_parse_exact() {
+        // No wildcards - exact match
+        assert_eq!(
+            WildcardPattern::parse("hello"),
+            WildcardPattern::Exact("hello".into())
+        );
+        assert_eq!(
+            WildcardPattern::parse("HELLO"),
+            WildcardPattern::Exact("hello".into()) // lowercased
+        );
+        assert_eq!(
+            WildcardPattern::parse("FooBar123"),
+            WildcardPattern::Exact("foobar123".into())
+        );
+    }
+
+    #[test]
+    fn wildcard_pattern_parse_prefix() {
+        // Trailing wildcard: foo*
+        assert_eq!(
+            WildcardPattern::parse("foo*"),
+            WildcardPattern::Prefix("foo".into())
+        );
+        assert_eq!(
+            WildcardPattern::parse("CONFIG*"),
+            WildcardPattern::Prefix("config".into())
+        );
+        assert_eq!(
+            WildcardPattern::parse("test*"),
+            WildcardPattern::Prefix("test".into())
+        );
+    }
+
+    #[test]
+    fn wildcard_pattern_parse_suffix() {
+        // Leading wildcard: *foo
+        assert_eq!(
+            WildcardPattern::parse("*foo"),
+            WildcardPattern::Suffix("foo".into())
+        );
+        assert_eq!(
+            WildcardPattern::parse("*Error"),
+            WildcardPattern::Suffix("error".into())
+        );
+        assert_eq!(
+            WildcardPattern::parse("*Handler"),
+            WildcardPattern::Suffix("handler".into())
+        );
+    }
+
+    #[test]
+    fn wildcard_pattern_parse_substring() {
+        // Both wildcards: *foo*
+        assert_eq!(
+            WildcardPattern::parse("*foo*"),
+            WildcardPattern::Substring("foo".into())
+        );
+        assert_eq!(
+            WildcardPattern::parse("*CONFIG*"),
+            WildcardPattern::Substring("config".into())
+        );
+        assert_eq!(
+            WildcardPattern::parse("*test*"),
+            WildcardPattern::Substring("test".into())
+        );
+    }
+
+    #[test]
+    fn wildcard_pattern_parse_edge_cases() {
+        // Empty after trimming wildcards
+        assert_eq!(
+            WildcardPattern::parse("*"),
+            WildcardPattern::Exact("".into())
+        );
+        assert_eq!(
+            WildcardPattern::parse("**"),
+            WildcardPattern::Exact("".into())
+        );
+        assert_eq!(
+            WildcardPattern::parse("***"),
+            WildcardPattern::Exact("".into())
+        );
+
+        // Single char with wildcards
+        assert_eq!(
+            WildcardPattern::parse("*a*"),
+            WildcardPattern::Substring("a".into())
+        );
+        assert_eq!(
+            WildcardPattern::parse("a*"),
+            WildcardPattern::Prefix("a".into())
+        );
+        assert_eq!(
+            WildcardPattern::parse("*a"),
+            WildcardPattern::Suffix("a".into())
+        );
+
+        // Multiple asterisks get trimmed
+        assert_eq!(
+            WildcardPattern::parse("***foo***"),
+            WildcardPattern::Substring("foo".into())
+        );
+    }
+
+    #[test]
+    fn wildcard_pattern_to_regex_suffix() {
+        let pattern = WildcardPattern::Suffix("foo".into());
+        assert_eq!(pattern.to_regex(), Some(".*foo".into()));
+    }
+
+    #[test]
+    fn wildcard_pattern_to_regex_substring() {
+        let pattern = WildcardPattern::Substring("bar".into());
+        assert_eq!(pattern.to_regex(), Some(".*bar.*".into()));
+    }
+
+    #[test]
+    fn wildcard_pattern_to_regex_exact_prefix_none() {
+        // Exact and Prefix patterns don't need regex
+        let exact = WildcardPattern::Exact("foo".into());
+        assert_eq!(exact.to_regex(), None);
+
+        let prefix = WildcardPattern::Prefix("bar".into());
+        assert_eq!(prefix.to_regex(), None);
+    }
+
+    #[test]
+    fn match_type_quality_factors() {
+        // Exact match has highest quality
+        assert_eq!(MatchType::Exact.quality_factor(), 1.0);
+        // Prefix is slightly lower
+        assert_eq!(MatchType::Prefix.quality_factor(), 0.9);
+        // Suffix is lower than prefix
+        assert_eq!(MatchType::Suffix.quality_factor(), 0.8);
+        // Substring is lower still
+        assert_eq!(MatchType::Substring.quality_factor(), 0.7);
+        // Implicit wildcard is lowest
+        assert_eq!(MatchType::ImplicitWildcard.quality_factor(), 0.6);
+    }
+
+    #[test]
+    fn wildcard_pattern_to_match_type() {
+        assert_eq!(
+            WildcardPattern::Exact("foo".into()).to_match_type(),
+            MatchType::Exact
+        );
+        assert_eq!(
+            WildcardPattern::Prefix("foo".into()).to_match_type(),
+            MatchType::Prefix
+        );
+        assert_eq!(
+            WildcardPattern::Suffix("foo".into()).to_match_type(),
+            MatchType::Suffix
+        );
+        assert_eq!(
+            WildcardPattern::Substring("foo".into()).to_match_type(),
+            MatchType::Substring
+        );
+    }
+
+    #[test]
+    fn dominant_match_type_single_terms() {
+        // Single terms return their pattern's match type
+        assert_eq!(dominant_match_type("hello"), MatchType::Exact);
+        assert_eq!(dominant_match_type("hello*"), MatchType::Prefix);
+        assert_eq!(dominant_match_type("*hello"), MatchType::Suffix);
+        assert_eq!(dominant_match_type("*hello*"), MatchType::Substring);
+    }
+
+    #[test]
+    fn dominant_match_type_multiple_terms() {
+        // Multiple terms: returns the "loosest" (lowest quality factor)
+        assert_eq!(dominant_match_type("foo bar"), MatchType::Exact);
+        assert_eq!(dominant_match_type("foo bar*"), MatchType::Prefix);
+        assert_eq!(dominant_match_type("foo *bar"), MatchType::Suffix);
+        assert_eq!(dominant_match_type("foo* *bar*"), MatchType::Substring);
+        // Substring is loosest even if other terms are exact
+        assert_eq!(dominant_match_type("foo *bar* baz"), MatchType::Substring);
+    }
+
+    #[test]
+    fn dominant_match_type_empty_query() {
+        assert_eq!(dominant_match_type(""), MatchType::Exact);
+        assert_eq!(dominant_match_type("   "), MatchType::Exact);
+    }
+
+    #[test]
+    fn escape_regex_basic() {
+        // Plain text should pass through unchanged
+        assert_eq!(escape_regex("hello"), "hello");
+        assert_eq!(escape_regex("foo123"), "foo123");
+        assert_eq!(escape_regex(""), "");
+    }
+
+    #[test]
+    fn escape_regex_special_chars() {
+        // All special regex chars should be escaped
+        assert_eq!(escape_regex("."), "\\.");
+        assert_eq!(escape_regex("*"), "\\*");
+        assert_eq!(escape_regex("+"), "\\+");
+        assert_eq!(escape_regex("?"), "\\?");
+        assert_eq!(escape_regex("("), "\\(");
+        assert_eq!(escape_regex(")"), "\\)");
+        assert_eq!(escape_regex("["), "\\[");
+        assert_eq!(escape_regex("]"), "\\]");
+        assert_eq!(escape_regex("{"), "\\{");
+        assert_eq!(escape_regex("}"), "\\}");
+        assert_eq!(escape_regex("|"), "\\|");
+        assert_eq!(escape_regex("^"), "\\^");
+        assert_eq!(escape_regex("$"), "\\$");
+        assert_eq!(escape_regex("\\"), "\\\\");
+    }
+
+    #[test]
+    fn escape_regex_complex_patterns() {
+        // Complex patterns with multiple special chars
+        assert_eq!(escape_regex("foo.bar"), "foo\\.bar");
+        assert_eq!(escape_regex("test[0-9]+"), "test\\[0-9\\]\\+");
+        assert_eq!(escape_regex("(a|b)"), "\\(a\\|b\\)");
+        assert_eq!(escape_regex("end$"), "end\\$");
+        assert_eq!(escape_regex("^start"), "\\^start");
+        assert_eq!(escape_regex("a*b+c?"), "a\\*b\\+c\\?");
+    }
+
+    #[test]
+    fn is_tool_invocation_noise_detects_noise() {
+        // Short tool invocations are noise
+        assert!(is_tool_invocation_noise("[Tool: Bash - Check status]"));
+        assert!(is_tool_invocation_noise("[Tool: Read]"));
+        assert!(is_tool_invocation_noise("  [Tool: Grep - Search files]  "));
+
+        // Very short tool markers
+        assert!(is_tool_invocation_noise("[tool]"));
+        assert!(is_tool_invocation_noise("tool: Bash"));
+    }
+
+    #[test]
+    fn is_tool_invocation_noise_allows_content() {
+        // Real content should not be flagged
+        assert!(!is_tool_invocation_noise(
+            "This is a normal message about tools"
+        ));
+        assert!(!is_tool_invocation_noise("The tool worked correctly"));
+        assert!(!is_tool_invocation_noise(
+            "I'll use the Read tool to check the file contents and then analyze the code structure for potential improvements."
+        ));
+    }
+
+    #[test]
+    fn deduplicate_hits_removes_exact_dupes() {
+        let hits = vec![
+            SearchHit {
+                title: "title1".into(),
+                snippet: "snip1".into(),
+                content: "hello world".into(),
+                score: 1.0,
+                source_path: "a.jsonl".into(),
+                agent: "agent".into(),
+                workspace: "ws".into(),
+                created_at: Some(100),
+                line_number: None,
+                match_type: MatchType::Exact,
+            },
+            SearchHit {
+                title: "title2".into(),
+                snippet: "snip2".into(),
+                content: "hello world".into(), // same content
+                score: 0.5,                    // lower score
+                source_path: "b.jsonl".into(),
+                agent: "agent".into(),
+                workspace: "ws".into(),
+                created_at: Some(200),
+                line_number: None,
+                match_type: MatchType::Exact,
+            },
+        ];
+
+        let deduped = deduplicate_hits(hits);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].score, 1.0); // kept higher score
+        assert_eq!(deduped[0].title, "title1");
+    }
+
+    #[test]
+    fn deduplicate_hits_keeps_higher_score() {
+        let hits = vec![
+            SearchHit {
+                title: "title1".into(),
+                snippet: "snip1".into(),
+                content: "hello world".into(),
+                score: 0.3, // lower score first
+                source_path: "a.jsonl".into(),
+                agent: "agent".into(),
+                workspace: "ws".into(),
+                created_at: Some(100),
+                line_number: None,
+                match_type: MatchType::Exact,
+            },
+            SearchHit {
+                title: "title2".into(),
+                snippet: "snip2".into(),
+                content: "hello world".into(),
+                score: 0.9, // higher score second
+                source_path: "b.jsonl".into(),
+                agent: "agent".into(),
+                workspace: "ws".into(),
+                created_at: Some(200),
+                line_number: None,
+                match_type: MatchType::Exact,
+            },
+        ];
+
+        let deduped = deduplicate_hits(hits);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].score, 0.9); // kept higher score
+        assert_eq!(deduped[0].title, "title2");
+    }
+
+    #[test]
+    fn deduplicate_hits_normalizes_whitespace() {
+        let hits = vec![
+            SearchHit {
+                title: "title1".into(),
+                snippet: "snip1".into(),
+                content: "hello    world".into(), // extra spaces
+                score: 1.0,
+                source_path: "a.jsonl".into(),
+                agent: "agent".into(),
+                workspace: "ws".into(),
+                created_at: Some(100),
+                line_number: None,
+                match_type: MatchType::Exact,
+            },
+            SearchHit {
+                title: "title2".into(),
+                snippet: "snip2".into(),
+                content: "hello world".into(), // normal spacing
+                score: 0.5,
+                source_path: "b.jsonl".into(),
+                agent: "agent".into(),
+                workspace: "ws".into(),
+                created_at: Some(200),
+                line_number: None,
+                match_type: MatchType::Exact,
+            },
+        ];
+
+        let deduped = deduplicate_hits(hits);
+        assert_eq!(deduped.len(), 1); // normalized to same content
+    }
+
+    #[test]
+    fn deduplicate_hits_filters_tool_noise() {
+        let hits = vec![
+            SearchHit {
+                title: "title1".into(),
+                snippet: "snip1".into(),
+                content: "[Tool: Bash - Run tests]".into(), // noise
+                score: 1.0,
+                source_path: "a.jsonl".into(),
+                agent: "agent".into(),
+                workspace: "ws".into(),
+                created_at: Some(100),
+                line_number: None,
+                match_type: MatchType::Exact,
+            },
+            SearchHit {
+                title: "title2".into(),
+                snippet: "snip2".into(),
+                content: "This is real content about testing".into(),
+                score: 0.5,
+                source_path: "b.jsonl".into(),
+                agent: "agent".into(),
+                workspace: "ws".into(),
+                created_at: Some(200),
+                line_number: None,
+                match_type: MatchType::Exact,
+            },
+        ];
+
+        let deduped = deduplicate_hits(hits);
+        assert_eq!(deduped.len(), 1);
+        assert!(deduped[0].content.contains("real content"));
+    }
+
+    #[test]
+    fn deduplicate_hits_preserves_unique_content() {
+        let hits = vec![
+            SearchHit {
+                title: "title1".into(),
+                snippet: "snip1".into(),
+                content: "first message".into(),
+                score: 1.0,
+                source_path: "a.jsonl".into(),
+                agent: "agent".into(),
+                workspace: "ws".into(),
+                created_at: Some(100),
+                line_number: None,
+                match_type: MatchType::Exact,
+            },
+            SearchHit {
+                title: "title2".into(),
+                snippet: "snip2".into(),
+                content: "second message".into(),
+                score: 0.8,
+                source_path: "b.jsonl".into(),
+                agent: "agent".into(),
+                workspace: "ws".into(),
+                created_at: Some(200),
+                line_number: None,
+                match_type: MatchType::Exact,
+            },
+            SearchHit {
+                title: "title3".into(),
+                snippet: "snip3".into(),
+                content: "third message".into(),
+                score: 0.6,
+                source_path: "c.jsonl".into(),
+                agent: "agent".into(),
+                workspace: "ws".into(),
+                created_at: Some(300),
+                line_number: None,
+                match_type: MatchType::Exact,
+            },
+        ];
+
+        let deduped = deduplicate_hits(hits);
+        assert_eq!(deduped.len(), 3); // all unique
+    }
+
+    #[test]
+    fn search_with_fallback_returns_exact_when_sufficient() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
+        // Add enough docs to exceed threshold - each with UNIQUE content to avoid dedup
+        for i in 0..5 {
+            let conv = NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: None,
+                title: Some(format!("doc-{i}")),
+                workspace: Some(std::path::PathBuf::from("/ws")),
+                source_path: dir.path().join(format!("{i}.jsonl")),
+                started_at: Some(100 + i),
+                ended_at: None,
+                metadata: serde_json::json!({}),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "user".into(),
+                    author: None,
+                    created_at: Some(100 + i),
+                    // Each doc has unique content but shares "apple" keyword
+                    content: format!("apple fruit number {i} is delicious and healthy"),
+                    extra: serde_json::json!({}),
+                    snippets: vec![],
+                }],
+            };
+            index.add_conversation(&conv)?;
+        }
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+
+        // Search with low threshold - should not trigger fallback
+        let result = client.search_with_fallback(
+            "apple",
+            SearchFilters::default(),
+            10,
+            0,
+            3, // threshold of 3
+        )?;
+
+        assert!(!result.wildcard_fallback);
+        assert!(result.hits.len() >= 3); // has enough results
+
+        Ok(())
+    }
+
+    #[test]
+    fn search_with_fallback_triggers_on_sparse_results() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
+        // Add docs with substring that won't match exact prefix
+        let conv = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("substring test".into()),
+            workspace: Some(std::path::PathBuf::from("/ws")),
+            source_path: dir.path().join("test.jsonl"),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(100),
+                content: "configuration management system".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+            }],
+        };
+        index.add_conversation(&conv)?;
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+
+        // Search for "config" which should match "configuration" via prefix
+        let result = client.search_with_fallback(
+            "config",
+            SearchFilters::default(),
+            10,
+            0,
+            5, // high threshold
+        )?;
+
+        // Since we have only 1 result and threshold is 5, it may trigger fallback
+        // but *config* would still match "configuration"
+        assert!(!result.hits.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn search_with_fallback_skips_when_query_has_wildcards() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
+        let conv = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("test".into()),
+            workspace: None,
+            source_path: dir.path().join("test.jsonl"),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(100),
+                content: "testing data".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+            }],
+        };
+        index.add_conversation(&conv)?;
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+
+        // Query already has wildcards - should not trigger fallback
+        let result = client.search_with_fallback(
+            "*test*",
+            SearchFilters::default(),
+            10,
+            0,
+            10, // high threshold
+        )?;
+
+        assert!(!result.wildcard_fallback); // shouldn't trigger fallback for wildcard queries
+        Ok(())
+    }
+
+    #[test]
+    fn search_with_fallback_skips_empty_query() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
+        let conv = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("test".into()),
+            workspace: None,
+            source_path: dir.path().join("test.jsonl"),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(100),
+                content: "testing data".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+            }],
+        };
+        index.add_conversation(&conv)?;
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+
+        // Empty query - should not trigger fallback
+        let result = client.search_with_fallback("  ", SearchFilters::default(), 10, 0, 10)?;
+
+        assert!(!result.wildcard_fallback);
+        Ok(())
+    }
+
+    #[test]
+    fn sanitize_query_preserves_wildcards() {
+        // Wildcards should be preserved
+        assert_eq!(sanitize_query("*foo*"), "*foo*");
+        assert_eq!(sanitize_query("foo*"), "foo*");
+        assert_eq!(sanitize_query("*bar"), "*bar");
+        assert_eq!(sanitize_query("*config*"), "*config*");
+    }
+
+    #[test]
+    fn sanitize_query_strips_other_special_chars() {
+        // Non-wildcard special chars become spaces
+        assert_eq!(sanitize_query("foo.bar"), "foo bar");
+        assert_eq!(sanitize_query("c++"), "c  ");
+        assert_eq!(sanitize_query("foo-bar"), "foo bar");
+        assert_eq!(sanitize_query("test_case"), "test case");
+    }
+
+    #[test]
+    fn sanitize_query_combined() {
+        // Mix of wildcards and special chars
+        assert_eq!(sanitize_query("*foo.bar*"), "*foo bar*");
+        assert_eq!(sanitize_query("test-*"), "test *");
+        assert_eq!(sanitize_query("*c++*"), "*c  *");
+    }
+
+    // Boolean query parsing tests
+    #[test]
+    fn parse_boolean_query_simple_terms() {
+        let tokens = parse_boolean_query("foo bar baz");
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0], QueryToken::Term("foo".to_string()));
+        assert_eq!(tokens[1], QueryToken::Term("bar".to_string()));
+        assert_eq!(tokens[2], QueryToken::Term("baz".to_string()));
+    }
+
+    #[test]
+    fn parse_boolean_query_and_operator() {
+        let tokens = parse_boolean_query("foo AND bar");
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0], QueryToken::Term("foo".to_string()));
+        assert_eq!(tokens[1], QueryToken::And);
+        assert_eq!(tokens[2], QueryToken::Term("bar".to_string()));
+
+        // Also test && syntax
+        let tokens2 = parse_boolean_query("foo && bar");
+        assert_eq!(tokens2.len(), 3);
+        assert_eq!(tokens2[1], QueryToken::And);
+    }
+
+    #[test]
+    fn parse_boolean_query_or_operator() {
+        let tokens = parse_boolean_query("foo OR bar");
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0], QueryToken::Term("foo".to_string()));
+        assert_eq!(tokens[1], QueryToken::Or);
+        assert_eq!(tokens[2], QueryToken::Term("bar".to_string()));
+
+        // Also test || syntax
+        let tokens2 = parse_boolean_query("foo || bar");
+        assert_eq!(tokens2.len(), 3);
+        assert_eq!(tokens2[1], QueryToken::Or);
+    }
+
+    #[test]
+    fn parse_boolean_query_not_operator() {
+        let tokens = parse_boolean_query("foo NOT bar");
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0], QueryToken::Term("foo".to_string()));
+        assert_eq!(tokens[1], QueryToken::Not);
+        assert_eq!(tokens[2], QueryToken::Term("bar".to_string()));
+    }
+
+    #[test]
+    fn parse_boolean_query_quoted_phrase() {
+        let tokens = parse_boolean_query(r#"foo "exact phrase" bar"#);
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0], QueryToken::Term("foo".to_string()));
+        assert_eq!(tokens[1], QueryToken::Phrase("exact phrase".to_string()));
+        assert_eq!(tokens[2], QueryToken::Term("bar".to_string()));
+    }
+
+    #[test]
+    fn parse_boolean_query_complex() {
+        let tokens = parse_boolean_query(r#"error OR warning NOT "false positive""#);
+        assert_eq!(tokens.len(), 5);
+        assert_eq!(tokens[0], QueryToken::Term("error".to_string()));
+        assert_eq!(tokens[1], QueryToken::Or);
+        assert_eq!(tokens[2], QueryToken::Term("warning".to_string()));
+        assert_eq!(tokens[3], QueryToken::Not);
+        assert_eq!(tokens[4], QueryToken::Phrase("false positive".to_string()));
+    }
+
+    #[test]
+    fn has_boolean_operators_detection() {
+        assert!(!has_boolean_operators("foo bar"));
+        assert!(has_boolean_operators("foo AND bar"));
+        assert!(has_boolean_operators("foo OR bar"));
+        assert!(has_boolean_operators("foo NOT bar"));
+        assert!(has_boolean_operators(r#""exact phrase""#));
+        assert!(has_boolean_operators("foo && bar"));
+        assert!(has_boolean_operators("foo || bar"));
+    }
+
+    #[test]
+    fn parse_boolean_query_case_insensitive_operators() {
+        // Operators should be case-insensitive
+        let tokens = parse_boolean_query("foo and bar or baz not qux");
+        assert_eq!(tokens.len(), 7);
+        assert_eq!(tokens[1], QueryToken::And);
+        assert_eq!(tokens[3], QueryToken::Or);
+        assert_eq!(tokens[5], QueryToken::Not);
+    }
+
+    #[test]
+    fn parse_boolean_query_with_wildcards() {
+        let tokens = parse_boolean_query("*config* OR env*");
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0], QueryToken::Term("*config*".to_string()));
+        assert_eq!(tokens[1], QueryToken::Or);
+        assert_eq!(tokens[2], QueryToken::Term("env*".to_string()));
+    }
+
+    // ============================================================
+    // Filter Fidelity Property Tests (glt.9)
+    // Verify filters are never violated in search results
+    // ============================================================
+
+    #[test]
+    fn filter_fidelity_agent_filter_respected() -> Result<()> {
+        // Multiple agents; filter should return only matching agent
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
+        // Agent A (codex)
+        let conv_a = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("alpha doc".into()),
+            workspace: None,
+            source_path: dir.path().join("a.jsonl"),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(100),
+                content: "hello world findme alpha".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+            }],
+        };
+        // Agent B (claude)
+        let conv_b = NormalizedConversation {
+            agent_slug: "claude".into(),
+            external_id: None,
+            title: Some("beta doc".into()),
+            workspace: None,
+            source_path: dir.path().join("b.jsonl"),
+            started_at: Some(200),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(200),
+                content: "hello world findme beta".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+            }],
+        };
+        index.add_conversation(&conv_a)?;
+        index.add_conversation(&conv_b)?;
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+
+        // Search with agent filter for codex only
+        let mut filters = SearchFilters::default();
+        filters.agents.insert("codex".into());
+
+        let hits = client.search("findme", filters.clone(), 10, 0)?;
+
+        // Property: all results must have agent == "codex"
+        for hit in &hits {
+            assert_eq!(
+                hit.agent, "codex",
+                "Agent filter violated: got agent '{}' instead of 'codex'",
+                hit.agent
+            );
+        }
+        assert!(!hits.is_empty(), "Should have found results");
+
+        // Repeat search (should use cache) and verify same property
+        let cached_hits = client.search("findme", filters, 10, 0)?;
+        for hit in &cached_hits {
+            assert_eq!(hit.agent, "codex", "Cached search violated agent filter");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_fidelity_workspace_filter_respected() -> Result<()> {
+        // Multiple workspaces; filter should return only matching workspace
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
+        // Workspace A
+        let conv_a = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("ws_a doc".into()),
+            workspace: Some(std::path::PathBuf::from("/workspace/alpha")),
+            source_path: dir.path().join("a.jsonl"),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(100),
+                content: "workspace test needle".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+            }],
+        };
+        // Workspace B
+        let conv_b = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("ws_b doc".into()),
+            workspace: Some(std::path::PathBuf::from("/workspace/beta")),
+            source_path: dir.path().join("b.jsonl"),
+            started_at: Some(200),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(200),
+                content: "workspace test needle".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+            }],
+        };
+        index.add_conversation(&conv_a)?;
+        index.add_conversation(&conv_b)?;
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+
+        // Search with workspace filter for beta only
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/workspace/beta".into());
+
+        let hits = client.search("needle", filters.clone(), 10, 0)?;
+
+        // Property: all results must have workspace == "/workspace/beta"
+        for hit in &hits {
+            assert_eq!(
+                hit.workspace, "/workspace/beta",
+                "Workspace filter violated: got '{}' instead of '/workspace/beta'",
+                hit.workspace
+            );
+        }
+        assert!(!hits.is_empty(), "Should have found results");
+
+        // Repeat search (should use cache)
+        let cached_hits = client.search("needle", filters, 10, 0)?;
+        for hit in &cached_hits {
+            assert_eq!(
+                hit.workspace, "/workspace/beta",
+                "Cached search violated workspace filter"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_fidelity_date_range_respected() -> Result<()> {
+        // Multiple dates; filter should return only within range
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
+        // Early doc (ts=100)
+        let conv_early = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("early".into()),
+            workspace: None,
+            source_path: dir.path().join("early.jsonl"),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(100),
+                content: "date range test".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+            }],
+        };
+        // Middle doc (ts=500)
+        let conv_middle = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("middle".into()),
+            workspace: None,
+            source_path: dir.path().join("middle.jsonl"),
+            started_at: Some(500),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(500),
+                content: "date range test".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+            }],
+        };
+        // Late doc (ts=900)
+        let conv_late = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("late".into()),
+            workspace: None,
+            source_path: dir.path().join("late.jsonl"),
+            started_at: Some(900),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(900),
+                content: "date range test".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+            }],
+        };
+        index.add_conversation(&conv_early)?;
+        index.add_conversation(&conv_middle)?;
+        index.add_conversation(&conv_late)?;
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+
+        // Filter for middle range only (400-600)
+        let filters = SearchFilters {
+            created_from: Some(400),
+            created_to: Some(600),
+            ..Default::default()
+        };
+
+        let hits = client.search("range", filters.clone(), 10, 0)?;
+
+        // Property: all results must have created_at within [400, 600]
+        for hit in &hits {
+            if let Some(ts) = hit.created_at {
+                assert!(
+                    (400..=600).contains(&ts),
+                    "Date range filter violated: got ts={} outside [400, 600]",
+                    ts
+                );
+            }
+        }
+        // Should find only the middle doc
+        assert_eq!(hits.len(), 1, "Should find exactly 1 doc in range");
+
+        // Repeat search (cache)
+        let cached_hits = client.search("range", filters, 10, 0)?;
+        for hit in &cached_hits {
+            if let Some(ts) = hit.created_at {
+                assert!(
+                    (400..=600).contains(&ts),
+                    "Cached search violated date range filter"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_fidelity_combined_filters_respected() -> Result<()> {
+        // Combine agent + workspace + date filters
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
+        // Create 4 docs with different combinations
+        let combinations = [
+            ("codex", "/ws/prod", 100),  // wrong date
+            ("claude", "/ws/prod", 500), // correct agent, correct ws, correct date
+            ("claude", "/ws/dev", 500),  // correct agent, wrong ws, correct date
+            ("claude", "/ws/prod", 900), // correct agent, correct ws, wrong date
+        ];
+
+        for (i, (agent, ws, ts)) in combinations.iter().enumerate() {
+            let conv = NormalizedConversation {
+                agent_slug: (*agent).into(),
+                external_id: None,
+                title: Some(format!("combo-{i}")),
+                workspace: Some(std::path::PathBuf::from(*ws)),
+                source_path: dir.path().join(format!("{i}.jsonl")),
+                started_at: Some(*ts),
+                ended_at: None,
+                metadata: serde_json::json!({}),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "user".into(),
+                    author: None,
+                    created_at: Some(*ts),
+                    content: "hello world combotest query".into(),
+                    extra: serde_json::json!({}),
+                    snippets: vec![],
+                }],
+            };
+            index.add_conversation(&conv)?;
+        }
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+
+        // Filter: claude + /ws/prod + date 400-600
+        let mut filters = SearchFilters::default();
+        filters.agents.insert("claude".into());
+        filters.workspaces.insert("/ws/prod".into());
+        filters.created_from = Some(400);
+        filters.created_to = Some(600);
+
+        let hits = client.search("combotest", filters.clone(), 10, 0)?;
+
+        // Should find exactly 1 doc (index 1 in combinations)
+        assert_eq!(hits.len(), 1, "Combined filter should match exactly 1 doc");
+
+        for hit in &hits {
+            assert_eq!(hit.agent, "claude", "Agent filter violated");
+            assert_eq!(hit.workspace, "/ws/prod", "Workspace filter violated");
+            if let Some(ts) = hit.created_at {
+                assert!((400..=600).contains(&ts), "Date filter violated: ts={ts}");
+            }
+        }
+
+        // Cache hit
+        let cached = client.search("combotest", filters, 10, 0)?;
+        assert_eq!(cached.len(), 1, "Cached result count mismatch");
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_fidelity_cache_key_isolation() {
+        // Different filters should have different cache keys
+        let client = SearchClient {
+            reader: None,
+            sqlite: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{}|schema:test", CACHE_KEY_VERSION),
+        };
+
+        let filters_empty = SearchFilters::default();
+        let mut filters_agent = SearchFilters::default();
+        filters_agent.agents.insert("codex".into());
+
+        let mut filters_ws = SearchFilters::default();
+        filters_ws.workspaces.insert("/ws".into());
+
+        let key_empty = client.cache_key("test", &filters_empty);
+        let key_agent = client.cache_key("test", &filters_agent);
+        let key_ws = client.cache_key("test", &filters_ws);
+
+        // All keys should be different
+        assert_ne!(
+            key_empty, key_agent,
+            "Empty vs agent filter keys should differ"
+        );
+        assert_ne!(
+            key_empty, key_ws,
+            "Empty vs workspace filter keys should differ"
+        );
+        assert_ne!(
+            key_agent, key_ws,
+            "Agent vs workspace filter keys should differ"
+        );
+
+        // Same filter should produce same key
+        let mut filters_agent2 = SearchFilters::default();
+        filters_agent2.agents.insert("codex".into());
+        let key_agent2 = client.cache_key("test", &filters_agent2);
+        assert_eq!(key_agent, key_agent2, "Same filter should produce same key");
     }
 }

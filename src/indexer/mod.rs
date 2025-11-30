@@ -30,6 +30,8 @@ pub struct IndexOptions {
     pub full: bool,
     pub force_rebuild: bool,
     pub watch: bool,
+    /// One-shot watch hook: when set, watch_sources will bypass notify and invoke reindex for these paths once.
+    pub watch_once_paths: Option<Vec<PathBuf>>,
     pub db_path: PathBuf,
     pub data_dir: PathBuf,
     pub progress: Option<Arc<IndexingProgress>>,
@@ -121,13 +123,13 @@ pub fn run_index(opts: IndexOptions) -> Result<()> {
         p.is_rebuilding.store(false, Ordering::Relaxed);
     }
 
-    if opts.watch {
+    if opts.watch || opts.watch_once_paths.is_some() {
         let opts_clone = opts.clone();
         let state = Arc::new(Mutex::new(load_watch_state(&opts.data_dir)));
         let storage = Arc::new(Mutex::new(storage));
         let t_index = Arc::new(Mutex::new(t_index));
 
-        watch_sources(move |paths| {
+        watch_sources(opts.watch_once_paths.clone(), move |paths| {
             let _ = reindex_paths(
                 &opts_clone,
                 paths,
@@ -156,7 +158,17 @@ fn ingest_batch(
     Ok(())
 }
 
-fn watch_sources<F: Fn(Vec<PathBuf>) + Send + 'static>(callback: F) -> Result<()> {
+fn watch_sources<F: Fn(Vec<PathBuf>) + Send + 'static>(
+    watch_once_paths: Option<Vec<PathBuf>>,
+    callback: F,
+) -> Result<()> {
+    if let Some(paths) = watch_once_paths {
+        if !paths.is_empty() {
+            callback(paths);
+        }
+        return Ok(());
+    }
+
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
@@ -493,6 +505,7 @@ mod tests {
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage};
     use rusqlite::Connection;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     fn norm_msg(idx: i64, created_at: i64) -> NormalizedMessage {
@@ -661,6 +674,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn watch_state_updates_after_reindex_paths() {
         let tmp = TempDir::new().unwrap();
         let xdg = tmp.path().join("xdg");
@@ -696,6 +710,7 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             progress: None,
+            watch_once_paths: None,
         };
 
         // Manually set up dependencies for reindex_paths
@@ -757,6 +772,7 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
     }
 
     #[test]
+    #[serial]
     fn reindex_paths_updates_progress() {
         let tmp = TempDir::new().unwrap();
         let xdg = tmp.path().join("xdg");
@@ -770,10 +786,15 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         let amp_dir = data_dir.join("amp");
         std::fs::create_dir_all(&amp_dir).unwrap();
         let amp_file = amp_dir.join("thread-progress.json");
+        // Use a timestamp well in the future to avoid race with file mtime.
+        // The since_ts filter compares message.createdAt > file_mtime - 1, so if
+        // there's any delay between capturing 'now' and writing the file, the message
+        // could be filtered out. Adding 10s buffer ensures the message is always included.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_millis() as i64;
+            .as_millis() as i64
+            + 10_000;
         std::fs::write(
             &amp_file,
             format!(
@@ -788,6 +809,7 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
             full: false,
             watch: false,
             force_rebuild: false,
+            watch_once_paths: None,
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             progress: Some(progress.clone()),

@@ -1,12 +1,47 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use tantivy::schema::*;
 use tantivy::{Index, IndexReader, IndexWriter, doc};
+use tracing::{debug, info, warn};
 
 use crate::connectors::NormalizedConversation;
 
 const SCHEMA_VERSION: &str = "v4";
+
+/// Minimum time (ms) between merge operations
+const MERGE_COOLDOWN_MS: i64 = 300_000; // 5 minutes
+
+/// Segment count threshold above which merge is triggered
+const MERGE_SEGMENT_THRESHOLD: usize = 4;
+
+/// Global last merge timestamp (ms since epoch)
+static LAST_MERGE_TS: AtomicI64 = AtomicI64::new(0);
+
+/// Debug status for segment merge operations
+#[derive(Debug, Clone)]
+pub struct MergeStatus {
+    /// Current number of searchable segments
+    pub segment_count: usize,
+    /// Timestamp of last merge (ms since epoch), 0 if never
+    pub last_merge_ts: i64,
+    /// Milliseconds since last merge, -1 if never merged
+    pub ms_since_last_merge: i64,
+    /// Segment count threshold for auto-merge
+    pub merge_threshold: usize,
+    /// Cooldown period between merges (ms)
+    pub cooldown_ms: i64,
+}
+
+impl MergeStatus {
+    /// Returns true if merge is recommended based on current status
+    pub fn should_merge(&self) -> bool {
+        self.segment_count >= self.merge_threshold
+            && (self.ms_since_last_merge < 0 || self.ms_since_last_merge >= self.cooldown_ms)
+    }
+}
 
 // Bump this when schema/tokenizer changes. Used to trigger rebuilds.
 pub const SCHEMA_HASH: &str = "tantivy-schema-v4-edge-ngram-preview";
@@ -91,6 +126,109 @@ impl TantivyIndex {
 
     pub fn reader(&self) -> Result<IndexReader> {
         Ok(self.index.reader()?)
+    }
+
+    /// Get current number of searchable segments
+    pub fn segment_count(&self) -> usize {
+        self.index
+            .searchable_segment_ids()
+            .map(|ids| ids.len())
+            .unwrap_or(0)
+    }
+
+    /// Returns debug info about merge status
+    pub fn merge_status(&self) -> MergeStatus {
+        let last_merge_ts = LAST_MERGE_TS.load(Ordering::Relaxed);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let ms_since_last = if last_merge_ts > 0 {
+            now_ms - last_merge_ts
+        } else {
+            -1 // never merged
+        };
+        MergeStatus {
+            segment_count: self.segment_count(),
+            last_merge_ts,
+            ms_since_last_merge: ms_since_last,
+            merge_threshold: MERGE_SEGMENT_THRESHOLD,
+            cooldown_ms: MERGE_COOLDOWN_MS,
+        }
+    }
+
+    /// Attempt to merge segments if idle conditions are met.
+    /// Returns Ok(true) if merge was triggered, Ok(false) if skipped.
+    /// Merge runs in background thread - this call is non-blocking.
+    pub fn optimize_if_idle(&mut self) -> Result<bool> {
+        let segment_ids = self.index.searchable_segment_ids()?;
+        let segment_count = segment_ids.len();
+
+        // Check if we have enough segments to warrant a merge
+        if segment_count < MERGE_SEGMENT_THRESHOLD {
+            debug!(
+                segments = segment_count,
+                threshold = MERGE_SEGMENT_THRESHOLD,
+                "Skipping merge: segment count below threshold"
+            );
+            return Ok(false);
+        }
+
+        // Check cooldown period
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let last_merge = LAST_MERGE_TS.load(Ordering::Relaxed);
+        if last_merge > 0 && (now_ms - last_merge) < MERGE_COOLDOWN_MS {
+            debug!(
+                ms_since_last = now_ms - last_merge,
+                cooldown = MERGE_COOLDOWN_MS,
+                "Skipping merge: cooldown period active"
+            );
+            return Ok(false);
+        }
+
+        // Trigger merge - this runs asynchronously in Tantivy's merge thread pool
+        info!(
+            segments = segment_count,
+            "Starting background segment merge"
+        );
+
+        // merge() returns a FutureResult that runs async; we drop it to let it run in background
+        // The merge will complete when Tantivy's internal thread pool processes it
+        let _merge_future = self.writer.merge(&segment_ids);
+        LAST_MERGE_TS.store(now_ms, Ordering::Relaxed);
+        info!("Segment merge initiated (running in background)");
+        Ok(true)
+    }
+
+    /// Force immediate segment merge and wait for completion.
+    /// Use sparingly - blocks until merge finishes.
+    pub fn force_merge(&mut self) -> Result<()> {
+        let segment_ids = self.index.searchable_segment_ids()?;
+        if segment_ids.is_empty() {
+            return Ok(());
+        }
+        info!(segments = segment_ids.len(), "Force merging all segments");
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        // Start merge and wait for completion
+        let merge_future = self.writer.merge(&segment_ids);
+        match merge_future.wait() {
+            Ok(_) => {
+                LAST_MERGE_TS.store(now_ms, Ordering::Relaxed);
+                info!("Force merge completed");
+                Ok(())
+            }
+            Err(e) => {
+                warn!(error = %e, "Force merge failed");
+                Err(anyhow!("merge failed: {e}"))
+            }
+        }
     }
 
     pub fn add_messages(
