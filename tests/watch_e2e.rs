@@ -2,7 +2,6 @@ use tempfile::TempDir;
 
 /// E2E: watch-mode smoke. Touch a fixture file and ensure incremental re-index logs fire.
 #[test]
-#[ignore = "requires watch loop; runs manually with env hook"]
 fn watch_mode_reindexes_on_file_change() {
     // Temp sandbox to isolate all filesystem access
     let sandbox = TempDir::new().expect("temp dir");
@@ -33,6 +32,8 @@ fn watch_mode_reindexes_on_file_change() {
     let output = std::process::Command::new(cass_bin)
         .arg("index")
         .arg("--watch")
+        .arg("--watch-once")
+        .arg(rollout.to_string_lossy().to_string())
         .arg("--data-dir")
         .arg(&data_dir)
         // Point all XDG/HOME roots at the sandbox to avoid scanning host data
@@ -40,10 +41,6 @@ fn watch_mode_reindexes_on_file_change() {
         .env("XDG_DATA_HOME", &xdg_data)
         .env("XDG_CONFIG_HOME", &xdg_config)
         .env("CODEX_HOME", data_dir.join(".codex"))
-        .env(
-            "CASS_TEST_WATCH_PATHS",
-            rollout.to_string_lossy().to_string(),
-        )
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
