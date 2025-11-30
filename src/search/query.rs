@@ -1405,13 +1405,13 @@ impl SearchClient {
             }
         }
 
-        if filters.created_from.is_some() {
+        if let Some(created_from) = filters.created_from {
             sql.push_str(" AND f.created_at >= ?");
-            params.push(Box::new(filters.created_from.unwrap()));
+            params.push(Box::new(created_from));
         }
-        if filters.created_to.is_some() {
+        if let Some(created_to) = filters.created_to {
             sql.push_str(" AND f.created_at <= ?");
-            params.push(Box::new(filters.created_to.unwrap()));
+            params.push(Box::new(created_to));
         }
 
         sql.push_str(" ORDER BY score LIMIT ? OFFSET ?");
