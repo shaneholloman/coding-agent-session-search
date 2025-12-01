@@ -425,13 +425,14 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "colored",
- "console 0.15.11",
+ "console 0.16.1",
  "criterion",
  "crossbeam-channel",
  "crossterm",
  "directories",
  "dirs",
  "dotenvy",
+ "glob",
  "indicatif",
  "insta",
  "lru",
@@ -452,7 +453,7 @@ dependencies = [
  "syntect",
  "tantivy",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
  "tokio",
  "toml",
  "tracing",
@@ -501,7 +502,6 @@ dependencies = [
  "encode_unicode",
  "libc",
  "once_cell",
- "unicode-width 0.2.0",
  "windows-sys 0.59.0",
 ]
 
@@ -1039,6 +1039,12 @@ dependencies = [
  "wasip2",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "half"
