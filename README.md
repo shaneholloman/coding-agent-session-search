@@ -6,7 +6,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
-Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, and Aider into a single, searchable timeline.
+Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, and Pi-Agent into a single, searchable timeline.
 
 <div align="center">
 
@@ -30,7 +30,7 @@ install.ps1 -EasyMode -Verify
 <div align="center">
 
 ### Search Results Across All Your Agents
-*Three-pane layout: filter bar, results list with color-coded agents (Claude, Codex, Gemini, etc.), and syntax-highlighted detail preview*
+*Three-pane layout: filter bar, results list with color-coded agents (Claude, Codex, Gemini, Pi-Agent, etc.), and syntax-highlighted detail preview*
 
 <img src="screenshots/screenshot_01.webp" alt="Main TUI showing search results across multiple coding agents" width="800">
 
@@ -56,7 +56,7 @@ install.ps1 -EasyMode -Verify
 
 ### The Problem
 
-AI coding agents are transforming how we write software. Claude Code, Codex, Cursor, Copilot, Aider; each creates a trail of conversations, debugging sessions, and problem-solving attempts. But this wealth of knowledge is **scattered and unsearchable**:
+AI coding agents are transforming how we write software. Claude Code, Codex, Cursor, Copilot, Aider, Pi-Agent; each creates a trail of conversations, debugging sessions, and problem-solving attempts. But this wealth of knowledge is **scattered and unsearchable**:
 
 - **Fragmented storage**: Each agent stores data differently—JSONL files, SQLite databases, markdown logs, proprietary JSON formats
 - **No cross-agent visibility**: Solutions discovered in Cursor are invisible when you're using Claude Code
@@ -120,6 +120,7 @@ Ingests history from all major local agents, normalizing them into a unified `Co
 - **Cursor**: `~/Library/Application Support/Cursor/User/` global + workspace storage (SQLite `state.vscdb`)
 - **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
 - **Aider**: `~/.aider.chat.history.md` and per-project `.aider.chat.history.md` files (Markdown)
+- **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content)
 
 ## 🤖 AI / Automation Mode
 
