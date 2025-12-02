@@ -58,11 +58,59 @@ We want all console output to be informative, detailed, stylish, colorful, etc. 
 
 If you aren't 100% sure about how to use a third party library, then you must SEARCH ONLINE to find the latest documentation website for the library to understand how it is supposed to work and the latest (mid-2025) suggested best practices and usage.
 
+---
+
+## 🔎 cass — Search All Your Agent History
+
+**What:** `cass` indexes conversations from Claude Code, Codex, Cursor, Gemini, Aider, ChatGPT, and more into a unified, searchable index. Before solving a problem from scratch, check if any agent already solved something similar.
+
+**⚠️ NEVER run bare `cass`** — it launches an interactive TUI. Always use `--robot` or `--json`.
+
+### Quick Start
+
+```bash
+# Check if index is healthy (exit 0=ok, 1=run index first)
+cass health
+
+# Search across all agent histories
+cass search "authentication error" --robot --limit 5
+
+# View a specific result (from search output)
+cass view /path/to/session.jsonl -n 42 --json
+
+# Expand context around a line
+cass expand /path/to/session.jsonl -n 42 -C 3 --json
+
+# Learn the full API
+cass capabilities --json      # Feature discovery
+cass robot-docs guide         # LLM-optimized docs
+```
+
+### Why Use It
+
+- **Cross-agent knowledge**: Find solutions from Codex when using Claude, or vice versa
+- **Forgiving syntax**: Typos and wrong flags are auto-corrected with teaching notes
+- **Token-efficient**: `--fields minimal` returns only essential data
+
+### Key Flags
+
+| Flag | Purpose |
+|------|---------|
+| `--robot` / `--json` | Machine-readable JSON output (required!) |
+| `--fields minimal` | Reduce payload: `source_path`, `line_number`, `agent` only |
+| `--limit N` | Cap result count |
+| `--agent NAME` | Filter to specific agent (claude, codex, cursor, etc.) |
+| `--days N` | Limit to recent N days |
+
+**stdout = data only, stderr = diagnostics. Exit 0 = success.**
+
+---
+
 ### Robot mode etiquette (CLI for AI agents)
-- Prefer `cass --robot-help` and `cass robot-docs <topic>` for machine-first docs.  
-- The CLI is forgiving: `--robot-docs=commands` and globals placed before/after the subcommand are auto-normalized.  
-- If parsing fails, we return actionable errors with examples; follow them and retry.  
-- Keep stdout clean: use `--json/--robot`; stderr only WARN/ERROR in robot mode (INFO auto-suppressed unless `-v`).  
+- Prefer `cass --robot-help` and `cass robot-docs <topic>` for machine-first docs.
+- The CLI is forgiving: `--robot-docs=commands` and globals placed before/after the subcommand are auto-normalized.
+- If parsing fails, we return actionable errors with examples; follow them and retry.
+- Keep stdout clean: use `--json/--robot`; stderr only WARN/ERROR in robot mode (INFO auto-suppressed unless `-v`).
 - Use `--color=never` in non-TTY automation if you want ANSI-free output.
 
 **CRITICAL:** Whenever you make any substantive changes or additions to the rust code, you MUST check that you didn't introduce any compiler errors, warnings, or clippy lints. You can do this by running the following commands:
