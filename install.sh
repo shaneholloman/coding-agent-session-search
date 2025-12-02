@@ -16,7 +16,7 @@ FROM_SOURCE=0
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
-LOCK_FILE="/tmp/coding-agent-search-install.$$.lock"
+LOCK_FILE="/tmp/coding-agent-search-install.lock"
 SYSTEM=0
 
 log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
@@ -150,13 +150,36 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
   fi
 fi
 
-exec 9>"$LOCK_FILE" || true
+# Cross-platform locking using mkdir (atomic on all POSIX systems including macOS)
+# flock is Linux-only and doesn't exist on macOS
+LOCK_DIR="${LOCK_FILE}.d"
 LOCKED=0
-if flock -n 9; then LOCKED=1; else err "Another installer is running (lock $LOCK_FILE)"; exit 1; fi
+if mkdir "$LOCK_DIR" 2>/dev/null; then
+  LOCKED=1
+  # Store PID for stale lock detection
+  echo $$ > "$LOCK_DIR/pid"
+else
+  # Check if existing lock is stale (process no longer running)
+  if [ -f "$LOCK_DIR/pid" ]; then
+    OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
+    if [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; then
+      # Stale lock, remove and retry
+      rm -rf "$LOCK_DIR"
+      if mkdir "$LOCK_DIR" 2>/dev/null; then
+        LOCKED=1
+        echo $$ > "$LOCK_DIR/pid"
+      fi
+    fi
+  fi
+  if [ "$LOCKED" -eq 0 ]; then
+    err "Another installer is running (lock $LOCK_DIR)"
+    exit 1
+  fi
+fi
 
 cleanup() {
   rm -rf "$TMP"
-  if [ "$LOCKED" -eq 1 ]; then rm -f "$LOCK_FILE"; fi
+  if [ "$LOCKED" -eq 1 ]; then rm -rf "$LOCK_DIR"; fi
 }
 
 TMP=$(mktemp -d)
