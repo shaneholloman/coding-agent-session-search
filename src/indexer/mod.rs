@@ -11,12 +11,14 @@ use notify::{RecursiveMode, Watcher, recommended_watcher};
 
 use crate::connectors::NormalizedConversation;
 use crate::connectors::{
-    Connector, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
+    Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
     claude_code::ClaudeCodeConnector, cline::ClineConnector, codex::CodexConnector,
     cursor::CursorConnector, gemini::GeminiConnector, opencode::OpenCodeConnector,
     pi_agent::PiAgentConnector,
 };
 use crate::search::tantivy::{TantivyIndex, index_dir};
+use crate::sources::config::Platform;
+use crate::sources::provenance::Origin;
 use crate::storage::sqlite::SqliteStorage;
 
 #[derive(Debug, Clone)]
@@ -171,7 +173,13 @@ pub fn run_index(
             let ctx = crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
 
             match conn.scan(&ctx) {
-                Ok(convs) => {
+                Ok(mut convs) => {
+                    // Inject local provenance into all conversations from local scan (P2.2)
+                    let local_origin = Origin::local();
+                    for conv in &mut convs {
+                        inject_provenance(conv, &local_origin);
+                    }
+
                     if let Some(p) = progress_ref {
                         p.total.fetch_add(convs.len(), Ordering::Relaxed);
                     }
@@ -408,6 +416,109 @@ fn watch_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Build a list of scan roots for multi-root indexing.
+///
+/// This function collects both:
+/// 1. Local default roots (from watch_roots() or standard locations)
+/// 2. Remote mirror roots (from registered sources in the database)
+///
+/// Part of P2.2 - Indexer multi-root orchestration.
+pub fn build_scan_roots(storage: &SqliteStorage, data_dir: &Path) -> Vec<ScanRoot> {
+    let mut roots = Vec::new();
+
+    // Add local default root with local provenance
+    // We create a single "local" root that encompasses all local paths.
+    // Connectors will use their own default detection logic when given an empty scan_roots.
+    // For explicit multi-root support, we add the local root.
+    roots.push(ScanRoot::local(data_dir.to_path_buf()));
+
+    // Add remote mirror roots from registered sources
+    if let Ok(sources) = storage.list_sources() {
+        for source in sources {
+            // Skip local source - already handled above
+            if !source.kind.is_remote() {
+                continue;
+            }
+
+            // Remote mirror directory: data_dir/remotes/<source_id>/mirror
+            let mirror_path = data_dir.join("remotes").join(&source.id).join("mirror");
+
+            if mirror_path.exists() {
+                let origin = Origin {
+                    source_id: source.id.clone(),
+                    kind: source.kind,
+                    host: source.host_label.clone(),
+                };
+
+                // Parse platform from source
+                let platform = source
+                    .platform
+                    .as_deref()
+                    .and_then(|p| match p.to_lowercase().as_str() {
+                        "macos" => Some(Platform::Macos),
+                        "linux" => Some(Platform::Linux),
+                        "windows" => Some(Platform::Windows),
+                        _ => None,
+                    });
+
+                // Parse workspace rewrites from config_json
+                let workspace_rewrites = source
+                    .config_json
+                    .as_ref()
+                    .and_then(|cfg| cfg.get("path_mappings"))
+                    .and_then(|m| m.as_object())
+                    .map(|obj| {
+                        obj.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                let mut scan_root = ScanRoot::remote(mirror_path, origin, platform);
+                scan_root.workspace_rewrites = workspace_rewrites;
+
+                roots.push(scan_root);
+
+                tracing::debug!(
+                    source_id = %source.id,
+                    kind = ?source.kind,
+                    host = ?source.host_label,
+                    "added_remote_scan_root"
+                );
+            }
+        }
+    }
+
+    roots
+}
+
+/// Inject provenance metadata into a conversation from a scan root's origin.
+///
+/// This adds the `cass.origin` field to the conversation's metadata JSON
+/// so that persistence can extract and store the source_id.
+///
+/// Part of P2.2 - provenance injection.
+fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
+    // Ensure metadata is an object
+    if !conv.metadata.is_object() {
+        conv.metadata = serde_json::json!({});
+    }
+
+    // Add cass.origin provenance
+    if let Some(obj) = conv.metadata.as_object_mut() {
+        obj.insert(
+            "cass".to_string(),
+            serde_json::json!({
+                "origin": {
+                    "source_id": origin.source_id,
+                    "kind": origin.kind.as_str(),
+                    "host": origin.host
+                }
+            }),
+        );
+    }
+}
+
 fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
     // Wrap in transaction to ensure atomic reset - if any DELETE fails,
     // all changes are rolled back to prevent inconsistent state
@@ -481,7 +592,13 @@ fn reindex_paths(
                 .map(|v| v.saturating_sub(1))
         };
         let ctx = crate::connectors::ScanContext::local_default(opts.data_dir.clone(), since_ts);
-        let convs = conn.scan(&ctx)?;
+        let mut convs = conn.scan(&ctx)?;
+
+        // Inject local provenance into all conversations (P2.2)
+        let local_origin = Origin::local();
+        for conv in &mut convs {
+            inject_provenance(conv, &local_origin);
+        }
 
         // Update total and phase to indexing
         if let Some(p) = &opts.progress {
@@ -607,8 +724,36 @@ pub mod persist {
     use crate::search::tantivy::TantivyIndex;
     use crate::storage::sqlite::{InsertOutcome, SqliteStorage};
 
+    /// Extract provenance (source_id, origin_host) from conversation metadata.
+    ///
+    /// Looks for `metadata.cass.origin` object with source_id and host fields.
+    /// Returns ("local", None) if no provenance is found.
+    fn extract_provenance(metadata: &serde_json::Value) -> (String, Option<String>) {
+        let source_id = metadata
+            .get("cass")
+            .and_then(|c| c.get("origin"))
+            .and_then(|o| o.get("source_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("local")
+            .to_string();
+
+        let origin_host = metadata
+            .get("cass")
+            .and_then(|c| c.get("origin"))
+            .and_then(|o| o.get("host"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        (source_id, origin_host)
+    }
+
     /// Convert a NormalizedConversation to the internal Conversation type for SQLite storage.
+    ///
+    /// Extracts provenance from `metadata.cass.origin` if present, otherwise defaults to local.
     pub fn map_to_internal(conv: &NormalizedConversation) -> Conversation {
+        // Extract provenance from metadata (P2.2)
+        let (source_id, origin_host) = extract_provenance(&conv.metadata);
+
         Conversation {
             id: None,
             agent_slug: conv.agent_slug.clone(),
@@ -645,8 +790,8 @@ pub mod persist {
                         .collect(),
                 })
                 .collect(),
-            source_id: "local".to_string(),
-            origin_host: None,
+            source_id,
+            origin_host,
         }
     }
 
@@ -706,6 +851,7 @@ pub mod persist {
 mod tests {
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage};
+    use crate::sources::provenance::SourceKind;
     use rusqlite::Connection;
     use serial_test::serial;
     use tempfile::TempDir;
@@ -1073,5 +1219,173 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         } else {
             unsafe { std::env::remove_var("XDG_DATA_HOME") };
         }
+    }
+
+    // P2.2 Tests: Multi-root orchestration and provenance injection
+
+    #[test]
+    fn inject_provenance_adds_cass_origin_to_metadata() {
+        let mut conv = norm_conv(Some("test"), vec![norm_msg(0, 100)]);
+        assert!(conv.metadata.get("cass").is_none());
+
+        let origin = Origin::local();
+        inject_provenance(&mut conv, &origin);
+
+        let cass = conv.metadata.get("cass").expect("cass field should exist");
+        let origin_obj = cass.get("origin").expect("origin should exist");
+        assert_eq!(origin_obj.get("source_id").unwrap().as_str(), Some("local"));
+        assert_eq!(origin_obj.get("kind").unwrap().as_str(), Some("local"));
+    }
+
+    #[test]
+    fn inject_provenance_handles_remote_origin() {
+        let mut conv = norm_conv(Some("test"), vec![norm_msg(0, 100)]);
+
+        let origin = Origin::remote_with_host("laptop", "user@laptop.local");
+        inject_provenance(&mut conv, &origin);
+
+        let cass = conv.metadata.get("cass").expect("cass field should exist");
+        let origin_obj = cass.get("origin").expect("origin should exist");
+        assert_eq!(origin_obj.get("source_id").unwrap().as_str(), Some("laptop"));
+        assert_eq!(origin_obj.get("kind").unwrap().as_str(), Some("ssh"));
+        assert_eq!(
+            origin_obj.get("host").unwrap().as_str(),
+            Some("user@laptop.local")
+        );
+    }
+
+    #[test]
+    fn extract_provenance_returns_local_for_empty_metadata() {
+        let conv = persist::map_to_internal(&NormalizedConversation {
+            agent_slug: "test".into(),
+            external_id: None,
+            title: None,
+            workspace: None,
+            source_path: PathBuf::from("/test"),
+            started_at: None,
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![],
+        });
+        assert_eq!(conv.source_id, "local");
+        assert!(conv.origin_host.is_none());
+    }
+
+    #[test]
+    fn extract_provenance_extracts_remote_origin() {
+        let metadata = serde_json::json!({
+            "cass": {
+                "origin": {
+                    "source_id": "laptop",
+                    "kind": "ssh",
+                    "host": "user@laptop.local"
+                }
+            }
+        });
+        let conv = persist::map_to_internal(&NormalizedConversation {
+            agent_slug: "test".into(),
+            external_id: None,
+            title: None,
+            workspace: None,
+            source_path: PathBuf::from("/test"),
+            started_at: None,
+            ended_at: None,
+            metadata,
+            messages: vec![],
+        });
+        assert_eq!(conv.source_id, "laptop");
+        assert_eq!(conv.origin_host, Some("user@laptop.local".to_string()));
+    }
+
+    #[test]
+    fn build_scan_roots_creates_local_root() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let roots = build_scan_roots(&storage, &data_dir);
+
+        // Should have at least the local root
+        assert!(!roots.is_empty());
+        assert_eq!(roots[0].origin.source_id, "local");
+        assert!(!roots[0].origin.is_remote());
+    }
+
+    #[test]
+    fn build_scan_roots_includes_remote_mirror_if_exists() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Create a remote source in the database
+        let db_path = data_dir.join("db.sqlite");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        // Register a remote source
+        storage
+            .upsert_source(&crate::sources::provenance::Source {
+                id: "laptop".to_string(),
+                kind: SourceKind::Ssh,
+                host_label: Some("user@laptop.local".to_string()),
+                machine_id: None,
+                platform: Some("linux".to_string()),
+                config_json: None,
+                created_at: None,
+                updated_at: None,
+            })
+            .unwrap();
+
+        // Create the mirror directory
+        let mirror_dir = data_dir.join("remotes").join("laptop").join("mirror");
+        std::fs::create_dir_all(&mirror_dir).unwrap();
+
+        let roots = build_scan_roots(&storage, &data_dir);
+
+        // Should have local root + remote root
+        assert_eq!(roots.len(), 2);
+
+        // Find the remote root
+        let remote_root = roots.iter().find(|r| r.origin.source_id == "laptop");
+        assert!(remote_root.is_some());
+        let remote_root = remote_root.unwrap();
+        assert!(remote_root.origin.is_remote());
+        assert_eq!(
+            remote_root.origin.host,
+            Some("user@laptop.local".to_string())
+        );
+        assert_eq!(remote_root.platform, Some(Platform::Linux));
+    }
+
+    #[test]
+    fn build_scan_roots_skips_nonexistent_mirror() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        // Register a remote source but don't create mirror directory
+        storage
+            .upsert_source(&crate::sources::provenance::Source {
+                id: "nonexistent".to_string(),
+                kind: SourceKind::Ssh,
+                host_label: Some("user@host".to_string()),
+                machine_id: None,
+                platform: None,
+                config_json: None,
+                created_at: None,
+                updated_at: None,
+            })
+            .unwrap();
+
+        let roots = build_scan_roots(&storage, &data_dir);
+
+        // Should only have local root (remote skipped because mirror doesn't exist)
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].origin.source_id, "local");
     }
 }
