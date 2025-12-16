@@ -3000,6 +3000,16 @@ pub fn run_tui(
                                         Style::default().fg(palette.hint),
                                     ));
                                 }
+                                // P4.1: Source badge for remote sessions
+                                if hit.source_id != "local" {
+                                    let source_label = hit.origin_host.as_deref().unwrap_or(&hit.source_id);
+                                    location_spans.push(Span::styled(
+                                        format!(" [{}]", source_label),
+                                        Style::default()
+                                            .fg(Color::Rgb(147, 112, 219)) // Medium purple for remote
+                                            .add_modifier(Modifier::ITALIC),
+                                    ));
+                                }
                                 let location_line = Line::from(location_spans);
 
                                 // Snippet with enhanced highlighting (multiple lines if long)
@@ -3038,10 +3048,17 @@ pub fn run_tui(
                                         .collect();
 
                                 // Alternating background for better visual separation (sux.6.3)
-                                let stripe_bg = if hit_idx % 2 == 0 {
+                                let base_stripe_bg = if hit_idx % 2 == 0 {
                                     theme.bg
                                 } else {
                                     lerp_color(theme.bg, Color::Rgb(255, 255, 255), 0.08)
+                                };
+                                // P4.1: Subtle tint for remote sources
+                                let stripe_bg = if hit.source_id != "local" {
+                                    // Add subtle purple tint for remote rows
+                                    lerp_color(base_stripe_bg, Color::Rgb(75, 0, 130), 0.08)
+                                } else {
+                                    base_stripe_bg
                                 };
 
                                 let mut lines = vec![header, location_line];
