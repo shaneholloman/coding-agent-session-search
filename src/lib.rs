@@ -452,6 +452,15 @@ pub enum SourcesCommand {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Diagnose source connectivity and configuration issues
+    Doctor {
+        /// Check only specific source (defaults to all)
+        #[arg(long, short)]
+        source: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -6916,6 +6925,9 @@ fn run_sources_command(cmd: SourcesCommand) -> CliResult<()> {
         SourcesCommand::Remove { name, purge, yes } => {
             run_sources_remove(&name, purge, yes)?;
         }
+        SourcesCommand::Doctor { source, json } => {
+            run_sources_doctor(source.as_deref(), json)?;
+        }
     }
     Ok(())
 }
@@ -7311,6 +7323,369 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
     }
 
     Ok(())
+}
+
+/// Diagnostic check result for sources doctor command (P5.6)
+#[derive(serde::Serialize)]
+struct DiagnosticCheck {
+    name: String,
+    status: String, // "pass", "warn", "fail"
+    message: String,
+    remediation: Option<String>,
+}
+
+/// Aggregated diagnostics for a single source (P5.6)
+#[derive(serde::Serialize)]
+struct SourceDiagnostics {
+    source_id: String,
+    checks: Vec<DiagnosticCheck>,
+    passed: usize,
+    warnings: usize,
+    failed: usize,
+}
+
+/// Diagnose source connectivity and configuration issues (P5.6)
+fn run_sources_doctor(source_filter: Option<&str>, json_output: bool) -> CliResult<()> {
+    use crate::sources::config::SourcesConfig;
+    use colored::Colorize;
+
+    let config = SourcesConfig::load().map_err(|e| CliError {
+        code: 9,
+        kind: "config",
+        message: format!("Failed to load sources config: {e}"),
+        hint: Some("Run 'cass sources add' to configure a source".into()),
+        retryable: false,
+    })?;
+
+    if config.sources.is_empty() {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "error": "No sources configured",
+                    "sources": []
+                })
+            );
+        } else {
+            println!("No remote sources configured.");
+            println!("Run 'cass sources add <url>' to add one.");
+        }
+        return Ok(());
+    }
+
+    // Filter sources if specified
+    let sources_to_check: Vec<_> = config
+        .sources
+        .iter()
+        .filter(|s| source_filter.is_none() || source_filter == Some(s.name.as_str()))
+        .collect();
+
+    if sources_to_check.is_empty() {
+        return Err(CliError {
+            code: 13,
+            kind: "not_found",
+            message: format!(
+                "Source '{}' not found",
+                source_filter.unwrap_or("unknown")
+            ),
+            hint: Some("Run 'cass sources list' to see configured sources".into()),
+            retryable: false,
+        });
+    }
+
+    let mut all_diagnostics = Vec::new();
+
+    for source in sources_to_check {
+        let mut checks = Vec::new();
+
+        // Check 1: SSH connectivity
+        let host = source.host.as_deref().unwrap_or("unknown");
+        let ssh_check = check_ssh_connectivity(host);
+        checks.push(ssh_check);
+
+        // Check 2: rsync availability on remote
+        let rsync_check = check_rsync_available(host);
+        checks.push(rsync_check);
+
+        // Check 3: Remote paths exist
+        for path in &source.paths {
+            let path_check = check_remote_path(host, path);
+            checks.push(path_check);
+        }
+
+        // Check 4: Local storage writable
+        let storage_check = check_local_storage(&source.name);
+        checks.push(storage_check);
+
+        // Compute summary
+        let passed = checks.iter().filter(|c| c.status == "pass").count();
+        let warnings = checks.iter().filter(|c| c.status == "warn").count();
+        let failed = checks.iter().filter(|c| c.status == "fail").count();
+
+        all_diagnostics.push(SourceDiagnostics {
+            source_id: source.name.clone(),
+            checks,
+            passed,
+            warnings,
+            failed,
+        });
+    }
+
+    // Output results
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&all_diagnostics).unwrap());
+    } else {
+        for diag in &all_diagnostics {
+            println!();
+            println!(
+                "{}",
+                format!("Checking source: {}", diag.source_id).bold()
+            );
+            println!();
+
+            for check in &diag.checks {
+                let icon = match check.status.as_str() {
+                    "pass" => "✓".green(),
+                    "warn" => "⚠".yellow(),
+                    "fail" => "✗".red(),
+                    _ => "?".normal(),
+                };
+                let name_styled = match check.status.as_str() {
+                    "pass" => check.name.green(),
+                    "warn" => check.name.yellow(),
+                    "fail" => check.name.red(),
+                    _ => check.name.normal(),
+                };
+                println!("  {} {}", icon, name_styled);
+                println!("    {}", check.message.dimmed());
+                if let Some(ref hint) = check.remediation {
+                    println!("    {}: {}", "Hint".cyan(), hint);
+                }
+            }
+
+            println!();
+            println!(
+                "Summary: {} passed, {} warnings, {} failed",
+                diag.passed.to_string().green(),
+                diag.warnings.to_string().yellow(),
+                diag.failed.to_string().red()
+            );
+        }
+    }
+
+    // Set exit code based on results
+    let total_failed: usize = all_diagnostics.iter().map(|d| d.failed).sum();
+    if total_failed > 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Check SSH connectivity to a host
+fn check_ssh_connectivity(host: &str) -> DiagnosticCheck {
+    let output = std::process::Command::new("ssh")
+        .args([
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            host,
+            "true",
+        ])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => DiagnosticCheck {
+            name: "SSH Connectivity".into(),
+            status: "pass".into(),
+            message: format!("Connected to {} successfully", host),
+            remediation: None,
+        },
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let remediation = if stderr.contains("Permission denied") {
+                Some("Ensure SSH key is added to remote authorized_keys".into())
+            } else if stderr.contains("Connection refused") {
+                Some("Verify SSH server is running on remote host".into())
+            } else if stderr.contains("Could not resolve") {
+                Some("Check hostname is correct and DNS resolves".into())
+            } else {
+                Some("Check SSH configuration and network connectivity".into())
+            };
+            DiagnosticCheck {
+                name: "SSH Connectivity".into(),
+                status: "fail".into(),
+                message: stderr.trim().to_string(),
+                remediation,
+            }
+        }
+        Err(e) => DiagnosticCheck {
+            name: "SSH Connectivity".into(),
+            status: "fail".into(),
+            message: format!("Failed to run ssh: {}", e),
+            remediation: Some("Ensure SSH client is installed and in PATH".into()),
+        },
+    }
+}
+
+/// Check rsync availability on remote
+fn check_rsync_available(host: &str) -> DiagnosticCheck {
+    let output = std::process::Command::new("ssh")
+        .args([
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "BatchMode=yes",
+            host,
+            "rsync",
+            "--version",
+        ])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let version = stdout
+                .lines()
+                .next()
+                .unwrap_or("version unknown")
+                .to_string();
+            DiagnosticCheck {
+                name: "rsync Available".into(),
+                status: "pass".into(),
+                message: version,
+                remediation: None,
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            DiagnosticCheck {
+                name: "rsync Available".into(),
+                status: "fail".into(),
+                message: format!("rsync not found: {}", stderr.trim()),
+                remediation: Some("Install rsync on the remote host".into()),
+            }
+        }
+        Err(e) => DiagnosticCheck {
+            name: "rsync Available".into(),
+            status: "warn".into(),
+            message: format!("Could not check rsync: {}", e),
+            remediation: Some("SSH connectivity may have failed".into()),
+        },
+    }
+}
+
+/// Check if a remote path exists
+fn check_remote_path(host: &str, path: &str) -> DiagnosticCheck {
+    let output = std::process::Command::new("ssh")
+        .args([
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "BatchMode=yes",
+            host,
+            "test",
+            "-d",
+            path,
+            "&&",
+            "ls",
+            "-1",
+            path,
+            "|",
+            "wc",
+            "-l",
+        ])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let count = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(0);
+            DiagnosticCheck {
+                name: format!("Remote Path: {}", path),
+                status: if count > 0 { "pass" } else { "warn" }.into(),
+                message: if count > 0 {
+                    format!("Path exists, {} items found", count)
+                } else {
+                    "Path exists but is empty".into()
+                },
+                remediation: if count == 0 {
+                    Some("No agent sessions on this machine yet".into())
+                } else {
+                    None
+                },
+            }
+        }
+        Ok(_) => DiagnosticCheck {
+            name: format!("Remote Path: {}", path),
+            status: "fail".into(),
+            message: "Path does not exist".into(),
+            remediation: Some("Remove this path or create it on the remote".into()),
+        },
+        Err(e) => DiagnosticCheck {
+            name: format!("Remote Path: {}", path),
+            status: "warn".into(),
+            message: format!("Could not check path: {}", e),
+            remediation: Some("SSH connectivity may have failed".into()),
+        },
+    }
+}
+
+/// Check if local storage directory is writable
+fn check_local_storage(source_name: &str) -> DiagnosticCheck {
+    if let Some(data_dir) = dirs::data_local_dir() {
+        let source_dir = data_dir.join("cass").join("remotes").join(source_name);
+
+        // Try to create the directory if it doesn't exist
+        if !source_dir.exists() {
+            if std::fs::create_dir_all(&source_dir).is_ok() {
+                return DiagnosticCheck {
+                    name: "Local Storage".into(),
+                    status: "pass".into(),
+                    message: format!("{} is writable", source_dir.display()),
+                    remediation: None,
+                };
+            } else {
+                return DiagnosticCheck {
+                    name: "Local Storage".into(),
+                    status: "fail".into(),
+                    message: format!("Cannot create {}", source_dir.display()),
+                    remediation: Some("Check file permissions on data directory".into()),
+                };
+            }
+        }
+
+        // Directory exists, check if writable
+        let test_file = source_dir.join(".doctor_test");
+        if std::fs::write(&test_file, b"test").is_ok() {
+            let _ = std::fs::remove_file(&test_file);
+            DiagnosticCheck {
+                name: "Local Storage".into(),
+                status: "pass".into(),
+                message: format!("{} is writable", source_dir.display()),
+                remediation: None,
+            }
+        } else {
+            DiagnosticCheck {
+                name: "Local Storage".into(),
+                status: "fail".into(),
+                message: format!("{} is not writable", source_dir.display()),
+                remediation: Some("Check file permissions on data directory".into()),
+            }
+        }
+    } else {
+        DiagnosticCheck {
+            name: "Local Storage".into(),
+            status: "fail".into(),
+            message: "Could not determine local data directory".into(),
+            remediation: Some("Set XDG_DATA_HOME or HOME environment variable".into()),
+        }
+    }
 }
 
 fn parse_datetime_flexible(s: &str) -> Option<i64> {
