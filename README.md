@@ -482,7 +482,8 @@ cass search "error" --robot --trace-file /tmp/cass-trace.json
 | `--aggregate agent,workspace,date` | Server-side aggregations |
 | `--explain` | Include query analysis (parsed query, cost estimate) |
 | `--dry-run` | Validate query without executing |
-| `--highlight` | Wrap matching terms with markers |
+| `--source <source>` | Filter by source: `local`, `remote`, `all`, or specific source ID |
+| `--highlight` | Highlight matching terms in output |
 
 ### Index Flags Reference
 
