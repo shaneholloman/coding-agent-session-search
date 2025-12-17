@@ -1327,6 +1327,35 @@ opt-level = "z"         # Optimize for size over speed
 - Binary size is ~40-50% smaller
 - No stack traces on panic (use debug builds for development)
 
+### CI Pipeline & Artifacts
+
+The CI pipeline (`.github/workflows/ci.yml`) runs on every PR and push to main:
+
+| Job | Purpose | Artifacts |
+|-----|---------|-----------|
+| `check` | fmt, clippy, tests, benches, UBS scan | None |
+| `e2e` | Integration tests (install, index, filters) | `test-artifacts-e2e` (traces, logs) |
+| `coverage` | Code coverage with llvm-cov | `coverage-report` (lcov.info, summary) |
+
+**Coverage Reports:**
+- `lcov.info` - LCOV format for tools like codecov
+- `coverage-summary.txt` - Human-readable summary
+- Coverage % shown in GitHub Actions step summary
+
+**Test Artifacts:**
+- Trace files from `--trace-file` runs
+- Test run summary logs
+- Retained for 7 days (e2e) / 30 days (coverage)
+
+```bash
+# Generate coverage locally
+cargo install cargo-llvm-cov
+cargo llvm-cov --all-features --workspace --text
+
+# Run specific e2e tests
+cargo test --test e2e_filters -- --test-threads=1
+```
+
 ---
 
 ## 💾 TUI State Persistence

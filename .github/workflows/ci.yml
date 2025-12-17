@@ -5,6 +5,10 @@ on:
   push:
     branches: [ main ]
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -38,7 +42,72 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+      - name: Create trace/log directories
+        run: mkdir -p test-artifacts/traces test-artifacts/logs
       - name: e2e install scripts (file:// artifacts)
         run: cargo test --test install_scripts -- --test-threads=1
       - name: e2e index + tui headless smoke
         run: cargo test --test e2e_index_tui -- --test-threads=1
+      - name: e2e filters
+        run: cargo test --test e2e_filters -- --test-threads=1
+      - name: e2e multi-connector
+        run: cargo test --test e2e_multi_connector -- --test-threads=1
+      - name: Collect trace files
+        if: always()
+        run: |
+          # Collect any trace files created during tests
+          find /tmp -name "*.trace" -o -name "cass-trace-*" 2>/dev/null | head -20 | xargs -I {} cp {} test-artifacts/traces/ 2>/dev/null || true
+          find . -name "*.trace" -type f 2>/dev/null | head -20 | xargs -I {} cp {} test-artifacts/traces/ 2>/dev/null || true
+          # Collect test output logs
+          echo "Test run completed at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > test-artifacts/logs/run-summary.txt
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts-e2e
+          path: test-artifacts/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  coverage:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate coverage report
+        run: |
+          cargo llvm-cov --all-features --workspace \
+            --ignore-filename-regex='(tests/|benches/|\.cargo/)' \
+            --lcov --output-path lcov.info
+      - name: Generate coverage summary
+        run: |
+          cargo llvm-cov --all-features --workspace \
+            --ignore-filename-regex='(tests/|benches/|\.cargo/)' \
+            --text > coverage-summary.txt
+          echo "## Coverage Summary" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -20 coverage-summary.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            lcov.info
+            coverage-summary.txt
+          retention-days: 30
+      - name: Check coverage threshold (informational)
+        run: |
+          # Extract total coverage percentage (informational, not blocking)
+          COVERAGE=$(grep -oP 'TOTAL.*?(\d+\.\d+)%' coverage-summary.txt | grep -oP '\d+\.\d+' | tail -1 || echo "0")
+          echo "Total coverage: ${COVERAGE}%"
+          echo "coverage=${COVERAGE}" >> $GITHUB_OUTPUT
+          # Log warning if below 50% (informational only)
+          if [ "$(echo "$COVERAGE < 50" | bc -l)" -eq 1 ]; then
+            echo "::warning::Coverage is below 50% (${COVERAGE}%)"
+          fi
