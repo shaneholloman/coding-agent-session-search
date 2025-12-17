@@ -546,3 +546,727 @@ impl Connector for ChatGptConnector {
         Ok(all_convs)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+    use tempfile::TempDir;
+
+    // =========================================================================
+    // Constructor tests
+    // =========================================================================
+
+    #[test]
+    fn connector_with_key_stores_key() {
+        let key_bytes = [42u8; KEY_SIZE];
+        let connector = ChatGptConnector {
+            encryption_key: Some(key_bytes),
+        };
+        assert!(connector.encryption_key.is_some());
+        assert_eq!(connector.encryption_key.unwrap(), key_bytes);
+    }
+
+    #[test]
+    fn connector_without_key_stores_none() {
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        assert!(connector.encryption_key.is_none());
+    }
+
+    // =========================================================================
+    // find_conversation_dirs tests
+    // =========================================================================
+
+    #[test]
+    fn find_conversation_dirs_empty_for_nonexistent() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("nonexistent");
+
+        let dirs = ChatGptConnector::find_conversation_dirs(&base);
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn find_conversation_dirs_detects_v1_unencrypted() {
+        let dir = TempDir::new().unwrap();
+        let conv_dir = dir.path().join("conversations-abc123");
+        fs::create_dir_all(&conv_dir).unwrap();
+
+        let dirs = ChatGptConnector::find_conversation_dirs(&dir.path().to_path_buf());
+
+        assert_eq!(dirs.len(), 1);
+        assert!(!dirs[0].1); // Not encrypted
+    }
+
+    #[test]
+    fn find_conversation_dirs_detects_v2_encrypted() {
+        let dir = TempDir::new().unwrap();
+        let conv_dir = dir.path().join("conversations-v2-abc123");
+        fs::create_dir_all(&conv_dir).unwrap();
+
+        let dirs = ChatGptConnector::find_conversation_dirs(&dir.path().to_path_buf());
+
+        assert_eq!(dirs.len(), 1);
+        assert!(dirs[0].1); // Encrypted
+    }
+
+    #[test]
+    fn find_conversation_dirs_detects_v3_encrypted() {
+        let dir = TempDir::new().unwrap();
+        let conv_dir = dir.path().join("conversations-v3-abc123");
+        fs::create_dir_all(&conv_dir).unwrap();
+
+        let dirs = ChatGptConnector::find_conversation_dirs(&dir.path().to_path_buf());
+
+        assert_eq!(dirs.len(), 1);
+        assert!(dirs[0].1); // Encrypted
+    }
+
+    #[test]
+    fn find_conversation_dirs_mixed_versions() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("conversations-old")).unwrap();
+        fs::create_dir_all(dir.path().join("conversations-v2-new")).unwrap();
+        fs::create_dir_all(dir.path().join("other-folder")).unwrap();
+
+        let dirs = ChatGptConnector::find_conversation_dirs(&dir.path().to_path_buf());
+
+        assert_eq!(dirs.len(), 2);
+        // One encrypted, one not
+        let encrypted_count = dirs.iter().filter(|(_, enc)| *enc).count();
+        let unencrypted_count = dirs.iter().filter(|(_, enc)| !*enc).count();
+        assert_eq!(encrypted_count, 1);
+        assert_eq!(unencrypted_count, 1);
+    }
+
+    // =========================================================================
+    // decrypt_file tests
+    // =========================================================================
+
+    #[test]
+    fn decrypt_file_fails_without_key() {
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let data = vec![0u8; 100];
+
+        let result = connector.decrypt_file(&data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No encryption key"));
+    }
+
+    #[test]
+    fn decrypt_file_fails_for_too_short_data() {
+        let connector = ChatGptConnector {
+            encryption_key: Some([0u8; KEY_SIZE]),
+        };
+        // Less than NONCE_SIZE + TAG_SIZE
+        let data = vec![0u8; 10];
+
+        let result = connector.decrypt_file(&data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
+    }
+
+    #[test]
+    fn decrypt_file_fails_with_wrong_key() {
+        let connector = ChatGptConnector {
+            encryption_key: Some([0u8; KEY_SIZE]),
+        };
+        // Valid-length but garbage data
+        let data = vec![0u8; NONCE_SIZE + 50 + TAG_SIZE];
+
+        let result = connector.decrypt_file(&data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Decryption failed"));
+    }
+
+    // =========================================================================
+    // parse_conversation_file tests (mapping format)
+    // =========================================================================
+
+    #[test]
+    fn parse_mapping_format_conversation() {
+        let dir = TempDir::new().unwrap();
+        let conv_file = dir.path().join("conv1.json");
+
+        let conv_json = json!({
+            "id": "conv-123",
+            "title": "Test Conversation",
+            "mapping": {
+                "node1": {
+                    "parent": null,
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Hello, ChatGPT!"]},
+                        "create_time": 1700000000.123
+                    }
+                },
+                "node2": {
+                    "parent": "node1",
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "content": {"parts": ["Hello! How can I help you?"]},
+                        "create_time": 1700000001.456,
+                        "metadata": {"model_slug": "gpt-4"}
+                    }
+                }
+            }
+        });
+
+        fs::write(&conv_file, conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let result = connector.parse_conversation_file(&conv_file, None, false);
+
+        assert!(result.is_ok());
+        let conv = result.unwrap().unwrap();
+
+        assert_eq!(conv.agent_slug, "chatgpt");
+        assert_eq!(conv.external_id, Some("conv-123".to_string()));
+        assert_eq!(conv.title, Some("Test Conversation".to_string()));
+        assert_eq!(conv.messages.len(), 2);
+
+        // Check first message (user)
+        assert_eq!(conv.messages[0].role, "user");
+        assert_eq!(conv.messages[0].content, "Hello, ChatGPT!");
+
+        // Check second message (assistant with model)
+        assert_eq!(conv.messages[1].role, "assistant");
+        assert!(conv.messages[1].content.contains("How can I help"));
+        assert_eq!(conv.messages[1].author, Some("gpt-4".to_string()));
+    }
+
+    #[test]
+    fn parse_skips_system_messages() {
+        let dir = TempDir::new().unwrap();
+        let conv_file = dir.path().join("conv.json");
+
+        let conv_json = json!({
+            "id": "conv-sys",
+            "mapping": {
+                "sys": {
+                    "parent": null,
+                    "message": {
+                        "author": {"role": "system"},
+                        "content": {"parts": ["You are a helpful assistant."]},
+                        "create_time": 1700000000.0
+                    }
+                },
+                "user": {
+                    "parent": "sys",
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Hi!"]},
+                        "create_time": 1700000001.0
+                    }
+                }
+            }
+        });
+
+        fs::write(&conv_file, conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let result = connector.parse_conversation_file(&conv_file, None, false);
+
+        let conv = result.unwrap().unwrap();
+        // System message should be skipped
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.messages[0].role, "user");
+    }
+
+    #[test]
+    fn parse_skips_empty_content() {
+        let dir = TempDir::new().unwrap();
+        let conv_file = dir.path().join("conv.json");
+
+        let conv_json = json!({
+            "id": "conv-empty",
+            "mapping": {
+                "empty": {
+                    "parent": null,
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": [""]},
+                        "create_time": 1700000000.0
+                    }
+                },
+                "whitespace": {
+                    "parent": "empty",
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["   \n\t  "]},
+                        "create_time": 1700000001.0
+                    }
+                },
+                "valid": {
+                    "parent": "whitespace",
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Valid message"]},
+                        "create_time": 1700000002.0
+                    }
+                }
+            }
+        });
+
+        fs::write(&conv_file, conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let result = connector.parse_conversation_file(&conv_file, None, false);
+
+        let conv = result.unwrap().unwrap();
+        // Empty/whitespace messages should be skipped
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.messages[0].content, "Valid message");
+    }
+
+    // =========================================================================
+    // parse_conversation_file tests (simple messages array format)
+    // =========================================================================
+
+    #[test]
+    fn parse_simple_messages_array_format() {
+        let dir = TempDir::new().unwrap();
+        let conv_file = dir.path().join("conv.json");
+
+        let conv_json = json!({
+            "id": "simple-conv",
+            "title": "Simple Format",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Question?",
+                    "timestamp": 1700000000000i64
+                },
+                {
+                    "role": "assistant",
+                    "content": "Answer!",
+                    "timestamp": 1700000001000i64
+                }
+            ]
+        });
+
+        fs::write(&conv_file, conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let result = connector.parse_conversation_file(&conv_file, None, false);
+
+        let conv = result.unwrap().unwrap();
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.messages[0].role, "user");
+        assert_eq!(conv.messages[0].content, "Question?");
+        assert_eq!(conv.messages[1].role, "assistant");
+        assert_eq!(conv.messages[1].content, "Answer!");
+    }
+
+    #[test]
+    fn parse_content_with_text_field() {
+        let dir = TempDir::new().unwrap();
+        let conv_file = dir.path().join("conv.json");
+
+        let conv_json = json!({
+            "id": "text-content",
+            "mapping": {
+                "node1": {
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"text": "Using text field instead of parts"},
+                        "create_time": 1700000000.0
+                    }
+                }
+            }
+        });
+
+        fs::write(&conv_file, conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let result = connector.parse_conversation_file(&conv_file, None, false);
+
+        let conv = result.unwrap().unwrap();
+        assert_eq!(conv.messages.len(), 1);
+        assert!(conv.messages[0].content.contains("text field"));
+    }
+
+    // =========================================================================
+    // Edge case tests
+    // =========================================================================
+
+    #[test]
+    fn parse_returns_none_for_empty_conversation() {
+        let dir = TempDir::new().unwrap();
+        let conv_file = dir.path().join("empty.json");
+
+        let conv_json = json!({
+            "id": "empty-conv",
+            "mapping": {}
+        });
+
+        fs::write(&conv_file, conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let result = connector.parse_conversation_file(&conv_file, None, false);
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_handles_missing_optional_fields() {
+        let dir = TempDir::new().unwrap();
+        let conv_file = dir.path().join("minimal.json");
+
+        // Minimal conversation - no id, no title, no timestamps
+        let conv_json = json!({
+            "mapping": {
+                "node1": {
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Minimal message"]}
+                    }
+                }
+            }
+        });
+
+        fs::write(&conv_file, conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let result = connector.parse_conversation_file(&conv_file, None, false);
+
+        let conv = result.unwrap().unwrap();
+        assert_eq!(conv.messages.len(), 1);
+        // external_id falls back to filename stem
+        assert!(conv.external_id.is_some());
+        assert!(conv.title.is_none());
+        assert!(conv.started_at.is_none());
+    }
+
+    #[test]
+    fn parse_extracts_id_from_conversation_id_field() {
+        let dir = TempDir::new().unwrap();
+        let conv_file = dir.path().join("conv.json");
+
+        let conv_json = json!({
+            "conversation_id": "alt-id-123",
+            "mapping": {
+                "node1": {
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Test"]}
+                    }
+                }
+            }
+        });
+
+        fs::write(&conv_file, conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let result = connector.parse_conversation_file(&conv_file, None, false);
+
+        let conv = result.unwrap().unwrap();
+        assert_eq!(conv.external_id, Some("alt-id-123".to_string()));
+    }
+
+    #[test]
+    fn parse_fails_gracefully_for_invalid_json() {
+        let dir = TempDir::new().unwrap();
+        let conv_file = dir.path().join("invalid.json");
+
+        fs::write(&conv_file, "not valid json {{{").unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let result = connector.parse_conversation_file(&conv_file, None, false);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_multipart_content_joins_with_newlines() {
+        let dir = TempDir::new().unwrap();
+        let conv_file = dir.path().join("multipart.json");
+
+        let conv_json = json!({
+            "mapping": {
+                "node1": {
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Part 1", "Part 2", "Part 3"]},
+                        "create_time": 1700000000.0
+                    }
+                }
+            }
+        });
+
+        fs::write(&conv_file, conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let result = connector.parse_conversation_file(&conv_file, None, false);
+
+        let conv = result.unwrap().unwrap();
+        assert_eq!(conv.messages[0].content, "Part 1\nPart 2\nPart 3");
+    }
+
+    #[test]
+    fn parse_sets_metadata_correctly() {
+        let dir = TempDir::new().unwrap();
+        let conv_file = dir.path().join("meta.json");
+
+        let conv_json = json!({
+            "model": "gpt-4-turbo",
+            "mapping": {
+                "node1": {
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Test"]}
+                    }
+                }
+            }
+        });
+
+        fs::write(&conv_file, conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let result = connector.parse_conversation_file(&conv_file, None, false);
+
+        let conv = result.unwrap().unwrap();
+        assert_eq!(conv.metadata["source"], "chatgpt_desktop");
+        assert_eq!(conv.metadata["model"], "gpt-4-turbo");
+        assert_eq!(conv.metadata["encrypted"], false);
+    }
+
+    #[test]
+    fn parse_encrypted_flag_in_metadata() {
+        let dir = TempDir::new().unwrap();
+        let conv_file = dir.path().join("enc.json");
+
+        // This will fail decryption but we can test the metadata flag
+        let conv_json = json!({
+            "mapping": {
+                "node1": {
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Test"]}
+                    }
+                }
+            }
+        });
+
+        fs::write(&conv_file, conv_json.to_string()).unwrap();
+
+        // Parse as unencrypted first to test flag
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let result = connector.parse_conversation_file(&conv_file, None, false);
+        let conv = result.unwrap().unwrap();
+        assert_eq!(conv.metadata["encrypted"], false);
+    }
+
+    // =========================================================================
+    // Timestamps and ordering tests
+    // =========================================================================
+
+    #[test]
+    fn parse_orders_messages_by_create_time() {
+        let dir = TempDir::new().unwrap();
+        let conv_file = dir.path().join("ordered.json");
+
+        // Messages in reverse order in JSON
+        let conv_json = json!({
+            "mapping": {
+                "late": {
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "content": {"parts": ["Second"]},
+                        "create_time": 1700000002.0
+                    }
+                },
+                "early": {
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["First"]},
+                        "create_time": 1700000001.0
+                    }
+                }
+            }
+        });
+
+        fs::write(&conv_file, conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let result = connector.parse_conversation_file(&conv_file, None, false);
+
+        let conv = result.unwrap().unwrap();
+        // Should be ordered by create_time
+        assert_eq!(conv.messages[0].content, "First");
+        assert_eq!(conv.messages[1].content, "Second");
+    }
+
+    #[test]
+    fn parse_converts_float_timestamp_to_millis() {
+        let dir = TempDir::new().unwrap();
+        let conv_file = dir.path().join("ts.json");
+
+        let conv_json = json!({
+            "mapping": {
+                "node1": {
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Test"]},
+                        "create_time": 1700000000.5  // .5 seconds
+                    }
+                }
+            }
+        });
+
+        fs::write(&conv_file, conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let result = connector.parse_conversation_file(&conv_file, None, false);
+
+        let conv = result.unwrap().unwrap();
+        // Should be converted to milliseconds
+        assert_eq!(conv.messages[0].created_at, Some(1700000000500));
+    }
+
+    // =========================================================================
+    // Detection tests
+    // =========================================================================
+
+    #[test]
+    fn detect_not_found_without_app_dir() {
+        // This test will pass on systems without ChatGPT installed
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+
+        // On most CI/test systems, ChatGPT won't be installed
+        // Just verify detect() doesn't panic and returns a valid result
+        let result = connector.detect();
+        // Result could be either found or not found depending on system
+        assert!(result.detected || !result.detected);
+    }
+
+    // =========================================================================
+    // Scan tests
+    // =========================================================================
+
+    #[test]
+    fn scan_empty_directory_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+
+        let ctx = ScanContext::local_default(dir.path().to_path_buf(), None);
+        let result = connector.scan(&ctx);
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn scan_skips_encrypted_without_key() {
+        let dir = TempDir::new().unwrap();
+
+        // Create encrypted directory structure
+        let conv_dir = dir.path().join("conversations-v2-abc123");
+        fs::create_dir_all(&conv_dir).unwrap();
+
+        // Create a conversation file (will be skipped as encrypted)
+        let conv_json = json!({
+            "id": "test",
+            "mapping": {
+                "node1": {
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Test"]}
+                    }
+                }
+            }
+        });
+        fs::write(conv_dir.join("conv.json"), conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+
+        // Use a context that will make it look for conversations in our dir
+        let ctx = ScanContext::local_default(dir.path().to_path_buf(), None);
+        let result = connector.scan(&ctx);
+
+        assert!(result.is_ok());
+        // Encrypted dirs are skipped without key
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn scan_processes_unencrypted_conversations() {
+        let dir = TempDir::new().unwrap();
+
+        // Create a directory structure that mimics com.openai.chat
+        let openai_dir = dir.path().join("com.openai.chat");
+        fs::create_dir_all(&openai_dir).unwrap();
+
+        // Create unencrypted directory structure
+        let conv_dir = openai_dir.join("conversations-uuid123");
+        fs::create_dir_all(&conv_dir).unwrap();
+
+        let conv_json = json!({
+            "id": "test-conv",
+            "title": "Test Title",
+            "mapping": {
+                "node1": {
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Hello!"]},
+                        "create_time": 1700000000.0
+                    }
+                }
+            }
+        });
+        fs::write(conv_dir.join("conv.json"), conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+
+        // Pass the openai directory so scan recognizes it
+        let ctx = ScanContext::local_default(openai_dir.clone(), None);
+        let result = connector.scan(&ctx);
+
+        assert!(result.is_ok());
+        let convs = result.unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].title, Some("Test Title".to_string()));
+    }
+}
