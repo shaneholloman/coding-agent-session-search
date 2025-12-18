@@ -1029,6 +1029,7 @@ classDiagram
  Connector <|-- CursorConnector
  Connector <|-- ChatGptConnector
  Connector <|-- AiderConnector
+ Connector <|-- PiAgentConnector
 
  CodexConnector ..> NormalizedConversation : emits
  ClineConnector ..> NormalizedConversation : emits
@@ -1039,6 +1040,7 @@ classDiagram
  CursorConnector ..> NormalizedConversation : emits
  ChatGptConnector ..> NormalizedConversation : emits
  AiderConnector ..> NormalizedConversation : emits
+ PiAgentConnector ..> NormalizedConversation : emits
 ```
 
 - **Polymorphic Scanning**: The indexer runs connector factories in parallel via rayon, creating fresh `Box<dyn Connector>` instances that are unaware of each other's underlying file formats (JSONL, SQLite, specialized JSON).
@@ -1066,7 +1068,7 @@ flowchart LR
  classDef pastel4 fill:#fff7e6,stroke:#f2c27f,color:#4d350f;
  classDef pastel5 fill:#ffeef2,stroke:#f5b0c2,color:#4d1f2c;
 
- subgraph Sources
+ subgraph Sources["Local Sources"]
  A1[Codex]:::pastel
  A2[Cline]:::pastel
  A3[Gemini]:::pastel
@@ -1076,6 +1078,13 @@ flowchart LR
  A7[Cursor]:::pastel
  A8[ChatGPT]:::pastel
  A9[Aider]:::pastel
+ A10[Pi-Agent]:::pastel
+ end
+
+ subgraph Remote["Remote Sources"]
+ R1["sources.toml"]:::pastel
+ R2["SSH/rsync\nSync Engine"]:::pastel2
+ R3["remotes/\nSynced Data"]:::pastel3
  end
 
  subgraph "Ingestion Layer"
@@ -1101,6 +1110,10 @@ flowchart LR
  A7 --> C1
  A8 --> C1
  A9 --> C1
+ A10 --> C1
+ R1 --> R2
+ R2 --> R3
+ R3 --> C1
  C1 -->|Persist| S1
  C1 -->|Index| T1
  S1 -.->|Rebuild| T1
