@@ -130,27 +130,13 @@ pub fn run_index(
         }
     }
 
-    // Define connector factories for parallel execution
-    // Each tuple: (name, factory_fn) where factory_fn creates a fresh Connector
-    #[allow(clippy::type_complexity)]
-    let connector_factories: Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> = vec![
-        ("codex", || Box::new(CodexConnector::new())),
-        ("cline", || Box::new(ClineConnector::new())),
-        ("gemini", || Box::new(GeminiConnector::new())),
-        ("claude", || Box::new(ClaudeCodeConnector::new())),
-        ("opencode", || Box::new(OpenCodeConnector::new())),
-        ("amp", || Box::new(AmpConnector::new())),
-        ("aider", || Box::new(AiderConnector::new())),
-        ("cursor", || Box::new(CursorConnector::new())),
-        ("chatgpt", || Box::new(ChatGptConnector::new())),
-        ("pi_agent", || Box::new(PiAgentConnector::new())),
-    ];
-
     // Run connector detection and scanning in parallel using rayon
     use rayon::prelude::*;
 
     let progress_ref = opts.progress.as_ref();
     let data_dir = opts.data_dir.clone();
+
+    let connector_factories = get_connector_factories();
 
     let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>)> = connector_factories
         .into_par_iter()
@@ -233,26 +219,24 @@ pub fn run_index(
         let storage = Arc::new(Mutex::new(storage));
         let t_index = Arc::new(Mutex::new(t_index));
 
+        // Detect roots once for the watcher setup
+        let watch_roots = detect_watch_roots();
+
         watch_sources(
             opts.watch_once_paths.clone(),
+            watch_roots.clone(),
             event_channel,
-            move |paths, is_rebuild| {
+            move |paths, roots, is_rebuild| {
                 if is_rebuild {
-                    // For full rebuild, we effectively restart the index process
-                    // But here we just trigger a re-scan of all roots
-                    // For simplicity, we can't easily recurse into run_index (lock issues)
-                    // So we emulate a re-scan by passing all watch roots and clearing since_ts logic
-                    // Or we can just call reindex_paths with all roots and a flag to ignore ts?
-                    // reindex_paths uses classify_paths which uses mtime.
-                    // To force reindex, we might need to clear watch state.
                     if let Ok(mut g) = state.lock() {
                         g.clear();
                         let _ = save_watch_state(&opts_clone.data_dir, &g);
                     }
-                    // Pass all watch roots
-                    let roots = watch_roots();
+                    // For rebuild, trigger reindex on all active roots
+                    let all_root_paths: Vec<PathBuf> = roots.iter().map(|(_, p)| p.clone()).collect();
                     let _ = reindex_paths(
                         &opts_clone,
+                        all_root_paths,
                         roots,
                         state.clone(),
                         storage.clone(),
@@ -263,6 +247,7 @@ pub fn run_index(
                     let _ = reindex_paths(
                         &opts_clone,
                         paths,
+                        roots,
                         state.clone(),
                         storage.clone(),
                         t_index.clone(),
@@ -291,14 +276,69 @@ fn ingest_batch(
     Ok(())
 }
 
-fn watch_sources<F: Fn(Vec<PathBuf>, bool) + Send + 'static>(
+/// Get all available connector factories.
+#[allow(clippy::type_complexity)]
+pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> {
+    vec![
+        ("codex", || Box::new(CodexConnector::new())),
+        ("cline", || Box::new(ClineConnector::new())),
+        ("gemini", || Box::new(GeminiConnector::new())),
+        ("claude", || Box::new(ClaudeCodeConnector::new())),
+        ("opencode", || Box::new(OpenCodeConnector::new())),
+        ("amp", || Box::new(AmpConnector::new())),
+        ("aider", || Box::new(AiderConnector::new())),
+        ("cursor", || Box::new(CursorConnector::new())),
+        ("chatgpt", || Box::new(ChatGptConnector::new())),
+        ("pi_agent", || Box::new(PiAgentConnector::new())),
+    ]
+}
+
+/// Detect all active roots for watching/scanning.
+fn detect_watch_roots() -> Vec<(ConnectorKind, PathBuf)> {
+    let factories = get_connector_factories();
+    let mut roots = Vec::new();
+    
+    for (name, factory) in factories {
+        if let Some(kind) = ConnectorKind::from_slug(name) {
+            let conn = factory();
+            let detection = conn.detect();
+            if detection.detected {
+                for root in detection.root_paths {
+                    roots.push((kind, root));
+                }
+            }
+        }
+    }
+    roots
+}
+
+impl ConnectorKind {
+    fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "codex" => Some(Self::Codex),
+            "cline" => Some(Self::Cline),
+            "gemini" => Some(Self::Gemini),
+            "claude" => Some(Self::Claude),
+            "amp" => Some(Self::Amp),
+            "opencode" => Some(Self::OpenCode),
+            "aider" => Some(Self::Aider),
+            "cursor" => Some(Self::Cursor),
+            "chatgpt" => Some(Self::ChatGpt),
+            "pi_agent" => Some(Self::PiAgent),
+            _ => None,
+        }
+    }
+}
+
+fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, PathBuf)], bool) + Send + 'static>(
     watch_once_paths: Option<Vec<PathBuf>>,
+    roots: Vec<(ConnectorKind, PathBuf)>,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
     callback: F,
 ) -> Result<()> {
     if let Some(paths) = watch_once_paths {
         if !paths.is_empty() {
-            callback(paths, false);
+            callback(paths, &roots, false);
         }
         return Ok(());
     }
@@ -312,8 +352,13 @@ fn watch_sources<F: Fn(Vec<PathBuf>, bool) + Send + 'static>(
         }
     })?;
 
-    for dir in watch_roots() {
-        let _ = watcher.watch(&dir, RecursiveMode::Recursive);
+    // Watch all detected roots
+    for (_, dir) in &roots {
+        if let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) {
+            tracing::warn!("failed to watch {}: {}", dir.display(), e);
+        } else {
+            tracing::info!("watching {}", dir.display());
+        }
     }
 
     let debounce = Duration::from_secs(2);
@@ -331,7 +376,7 @@ fn watch_sources<F: Fn(Vec<PathBuf>, bool) + Send + 'static>(
                     }
                     IndexerEvent::Command(cmd) => match cmd {
                         ReindexCommand::Full => {
-                            callback(vec![], true);
+                            callback(vec![], &roots, true);
                         }
                     },
                 },
@@ -341,8 +386,8 @@ fn watch_sources<F: Fn(Vec<PathBuf>, bool) + Send + 'static>(
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(first_event.unwrap_or(now));
             if elapsed >= max_wait {
-                callback(std::mem::take(&mut pending), false);
-                first_event = None;
+                callback(std::mem::take(&mut pending), &roots, false);
+                first_event = None; // Reset debounce
                 continue;
             }
 
@@ -357,15 +402,15 @@ fn watch_sources<F: Fn(Vec<PathBuf>, bool) + Send + 'static>(
                             // Flush pending first? Or discard?
                             // Let's flush pending then do full.
                             if !pending.is_empty() {
-                                callback(std::mem::take(&mut pending), false);
+                                callback(std::mem::take(&mut pending), &roots, false);
                             }
-                            callback(vec![], true);
+                            callback(vec![], &roots, true);
                             first_event = None; // Reset debounce
                         }
                     },
                 },
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    callback(std::mem::take(&mut pending), false);
+                    callback(std::mem::take(&mut pending), &roots, false);
                     first_event = None;
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -375,45 +420,195 @@ fn watch_sources<F: Fn(Vec<PathBuf>, bool) + Send + 'static>(
     Ok(())
 }
 
-fn watch_roots() -> Vec<PathBuf> {
-    let mut roots = vec![
-        std::env::var("CODEX_HOME").map_or_else(
-            |_| dirs::home_dir().unwrap_or_default().join(".codex/sessions"),
-            PathBuf::from,
-        ),
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".config/Code/User/globalStorage/saoudrizwan.claude-dev"),
-        dirs::home_dir().unwrap_or_default().join(".gemini/tmp"),
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".claude/projects"),
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".config/Code/User/globalStorage/sourcegraph.amp"),
-        dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("amp"),
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join(".opencode"),
-        dirs::home_dir().unwrap_or_default().join(".opencode"),
-    ];
+fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
+    // Wrap in transaction to ensure atomic reset - if any DELETE fails,
+    // all changes are rolled back to prevent inconsistent state
+    storage.raw().execute_batch(
+        "BEGIN TRANSACTION;
+         DELETE FROM fts_messages;
+         DELETE FROM snippets;
+         DELETE FROM messages;
+         DELETE FROM conversations;
+         DELETE FROM agents;
+         DELETE FROM workspaces;
+         DELETE FROM tags;
+         DELETE FROM conversation_tags;
+         COMMIT;",
+    )?;
+    Ok(())
+}
 
-    // Cursor IDE chat storage
-    if let Some(cursor_base) = crate::connectors::cursor::CursorConnector::app_support_dir() {
-        roots.push(cursor_base);
+fn reindex_paths(
+    opts: &IndexOptions,
+    paths: Vec<PathBuf>,
+    roots: &[(ConnectorKind, PathBuf)],
+    state: Arc<Mutex<HashMap<ConnectorKind, i64>>>,
+    storage: Arc<Mutex<SqliteStorage>>,
+    t_index: Arc<Mutex<TantivyIndex>>,
+    force_full: bool,
+) -> Result<()> {
+    // DO NOT lock storage/index here for the whole duration.
+    // We only need them for the ingest phase, not the scan phase.
+
+    let triggers = classify_paths(paths, roots);
+    if triggers.is_empty() {
+        return Ok(());
     }
 
-    // ChatGPT desktop (macOS)
-    if let Some(chat_base) = crate::connectors::chatgpt::ChatGptConnector::app_support_dir() {
-        roots.push(chat_base);
+    for (kind, ts) in triggers {
+        let conn: Box<dyn Connector> = match kind {
+            ConnectorKind::Codex => Box::new(CodexConnector::new()),
+            ConnectorKind::Cline => Box::new(ClineConnector::new()),
+            ConnectorKind::Gemini => Box::new(GeminiConnector::new()),
+            ConnectorKind::Claude => Box::new(ClaudeCodeConnector::new()),
+            ConnectorKind::Amp => Box::new(AmpConnector::new()),
+            ConnectorKind::OpenCode => Box::new(OpenCodeConnector::new()),
+            ConnectorKind::Aider => Box::new(AiderConnector::new()),
+            ConnectorKind::Cursor => Box::new(CursorConnector::new()),
+            ConnectorKind::ChatGpt => Box::new(ChatGptConnector::new()),
+            ConnectorKind::PiAgent => Box::new(PiAgentConnector::new()),
+        };
+        let detect = conn.detect();
+        if !detect.detected {
+            continue;
+        }
+
+        // Update phase to scanning
+        if let Some(p) = &opts.progress {
+            p.phase.store(1, Ordering::Relaxed);
+        }
+
+        let since_ts = if force_full {
+            None
+        } else {
+            let guard = state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            guard
+                .get(&kind)
+                .copied()
+                .or_else(|| ts.map(|v| v.saturating_sub(1)))
+                .map(|v| v.saturating_sub(1))
+        };
+        let ctx = crate::connectors::ScanContext::local_default(opts.data_dir.clone(), since_ts);
+        
+        // SCAN PHASE: IO-heavy, no locks held
+        let mut convs = conn.scan(&ctx)?;
+
+        // Inject local provenance into all conversations (P2.2)
+        let local_origin = Origin::local();
+        for conv in &mut convs {
+            inject_provenance(conv, &local_origin);
+        }
+
+        // Update total and phase to indexing
+        if let Some(p) = &opts.progress {
+            p.total.fetch_add(convs.len(), Ordering::Relaxed);
+            p.phase.store(2, Ordering::Relaxed);
+        }
+
+        tracing::info!(?kind, conversations = convs.len(), since_ts, "watch_scan");
+
+        // INGEST PHASE: Acquire locks briefly
+        {
+            let mut storage = storage
+                .lock()
+                .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+            let mut t_index = t_index
+                .lock()
+                .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
+
+            ingest_batch(&mut storage, &mut t_index, &convs, &opts.progress)?;
+
+            // Commit to Tantivy immediately to ensure index consistency before advancing watch state.
+            t_index.commit()?;
+        }
+
+        if let Some(ts_val) = ts {
+            let mut guard = state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            let entry = guard.entry(kind).or_insert(ts_val);
+            *entry = (*entry).max(ts_val);
+            save_watch_state(&opts.data_dir, &guard)?;
+        }
     }
 
-    // Aider keeps history alongside the current workspace
-    roots.push(std::env::current_dir().unwrap_or_default());
+    // Reset phase to idle if progress exists
+    if let Some(p) = &opts.progress {
+        p.phase.store(0, Ordering::Relaxed);
+    }
 
-    roots
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ConnectorKind {
+    Codex,
+    Cline,
+    Gemini,
+    Claude,
+    Amp,
+    OpenCode,
+    Aider,
+    Cursor,
+    ChatGpt,
+    PiAgent,
+}
+
+fn state_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("watch_state.json")
+}
+
+fn load_watch_state(data_dir: &Path) -> HashMap<ConnectorKind, i64> {
+    let path = state_path(data_dir);
+    if let Ok(bytes) = fs::read(&path)
+        && let Ok(map) = serde_json::from_slice(&bytes)
+    {
+        return map;
+    }
+    HashMap::new()
+}
+
+fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Result<()> {
+    let path = state_path(data_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(state)?;
+    fs::write(path, json)?;
+    Ok(())
+}
+
+fn classify_paths(paths: Vec<PathBuf>, roots: &[(ConnectorKind, PathBuf)]) -> Vec<(ConnectorKind, Option<i64>)> {
+    let mut map: HashMap<ConnectorKind, Option<i64>> = HashMap::new();
+    for p in paths {
+        if let Ok(meta) = std::fs::metadata(&p)
+            && let Ok(time) = meta.modified()
+            && let Ok(dur) = time.duration_since(std::time::UNIX_EPOCH)
+        {
+            let ts = Some(dur.as_millis() as i64);
+            
+            // Check against known roots (dynamic classification)
+            let kind = roots.iter().find_map(|(k, root)| {
+                if p.starts_with(root) {
+                    Some(*k)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(kind) = kind {
+                let entry = map.entry(kind).or_insert(None);
+                *entry = match (*entry, ts) {
+                    (Some(prev), Some(cur)) => Some(prev.max(cur)),
+                    (None, Some(cur)) => Some(cur),
+                    _ => *entry,
+                };
+            }
+        }
+    }
+    map.into_iter().collect()
 }
 
 /// Build a list of scan roots for multi-root indexing.
@@ -604,207 +799,6 @@ pub fn apply_workspace_rewrite(
             return;
         }
     }
-}
-
-fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
-    // Wrap in transaction to ensure atomic reset - if any DELETE fails,
-    // all changes are rolled back to prevent inconsistent state
-    storage.raw().execute_batch(
-        "BEGIN TRANSACTION;
-         DELETE FROM fts_messages;
-         DELETE FROM snippets;
-         DELETE FROM messages;
-         DELETE FROM conversations;
-         DELETE FROM agents;
-         DELETE FROM workspaces;
-         DELETE FROM tags;
-         DELETE FROM conversation_tags;
-         COMMIT;",
-    )?;
-    Ok(())
-}
-
-fn reindex_paths(
-    opts: &IndexOptions,
-    paths: Vec<PathBuf>,
-    state: Arc<Mutex<HashMap<ConnectorKind, i64>>>,
-    storage: Arc<Mutex<SqliteStorage>>,
-    t_index: Arc<Mutex<TantivyIndex>>,
-    force_full: bool,
-) -> Result<()> {
-    let mut storage = storage
-        .lock()
-        .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
-    let mut t_index = t_index
-        .lock()
-        .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
-
-    let triggers = classify_paths(paths);
-    if triggers.is_empty() {
-        return Ok(());
-    }
-
-    for (kind, ts) in triggers {
-        let conn: Box<dyn Connector> = match kind {
-            ConnectorKind::Codex => Box::new(CodexConnector::new()),
-            ConnectorKind::Cline => Box::new(ClineConnector::new()),
-            ConnectorKind::Gemini => Box::new(GeminiConnector::new()),
-            ConnectorKind::Claude => Box::new(ClaudeCodeConnector::new()),
-            ConnectorKind::Amp => Box::new(AmpConnector::new()),
-            ConnectorKind::OpenCode => Box::new(OpenCodeConnector::new()),
-            ConnectorKind::Aider => Box::new(AiderConnector::new()),
-            ConnectorKind::Cursor => Box::new(CursorConnector::new()),
-            ConnectorKind::ChatGpt => Box::new(ChatGptConnector::new()),
-            ConnectorKind::PiAgent => Box::new(PiAgentConnector::new()),
-        };
-        let detect = conn.detect();
-        if !detect.detected {
-            continue;
-        }
-
-        // Update phase to scanning
-        if let Some(p) = &opts.progress {
-            p.phase.store(1, Ordering::Relaxed);
-        }
-
-        let since_ts = if force_full {
-            None
-        } else {
-            let guard = state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-            guard
-                .get(&kind)
-                .copied()
-                .or_else(|| ts.map(|v| v.saturating_sub(1)))
-                .map(|v| v.saturating_sub(1))
-        };
-        let ctx = crate::connectors::ScanContext::local_default(opts.data_dir.clone(), since_ts);
-        let mut convs = conn.scan(&ctx)?;
-
-        // Inject local provenance into all conversations (P2.2)
-        let local_origin = Origin::local();
-        for conv in &mut convs {
-            inject_provenance(conv, &local_origin);
-        }
-
-        // Update total and phase to indexing
-        if let Some(p) = &opts.progress {
-            p.total.fetch_add(convs.len(), Ordering::Relaxed);
-            p.phase.store(2, Ordering::Relaxed);
-        }
-
-        tracing::info!(?kind, conversations = convs.len(), since_ts, "watch_scan");
-        ingest_batch(&mut storage, &mut t_index, &convs, &opts.progress)?;
-
-        // Commit to Tantivy immediately to ensure index consistency before advancing watch state.
-        // This prevents a state where we think we've indexed up to T, but the index is stale.
-        t_index.commit()?;
-
-        if let Some(ts_val) = ts {
-            let mut guard = state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-            let entry = guard.entry(kind).or_insert(ts_val);
-            *entry = (*entry).max(ts_val);
-            save_watch_state(&opts.data_dir, &guard)?;
-        }
-    }
-
-    // Reset phase to idle if progress exists
-    if let Some(p) = &opts.progress {
-        p.phase.store(0, Ordering::Relaxed);
-    }
-
-    Ok(())
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ConnectorKind {
-    Codex,
-    Cline,
-    Gemini,
-    Claude,
-    Amp,
-    OpenCode,
-    Aider,
-    Cursor,
-    ChatGpt,
-    PiAgent,
-}
-
-fn state_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("watch_state.json")
-}
-
-fn load_watch_state(data_dir: &Path) -> HashMap<ConnectorKind, i64> {
-    let path = state_path(data_dir);
-    if let Ok(bytes) = fs::read(&path)
-        && let Ok(map) = serde_json::from_slice(&bytes)
-    {
-        return map;
-    }
-    HashMap::new()
-}
-
-fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Result<()> {
-    let path = state_path(data_dir);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_vec_pretty(state)?;
-    fs::write(path, json)?;
-    Ok(())
-}
-
-fn classify_paths(paths: Vec<PathBuf>) -> Vec<(ConnectorKind, Option<i64>)> {
-    let mut map: HashMap<ConnectorKind, Option<i64>> = HashMap::new();
-    for p in paths {
-        if let Ok(meta) = std::fs::metadata(&p)
-            && let Ok(time) = meta.modified()
-            && let Ok(dur) = time.duration_since(std::time::UNIX_EPOCH)
-        {
-            let ts = Some(dur.as_millis() as i64);
-            let s = p.to_string_lossy().replace('\\', "/");
-            let tag =
-                if s.contains(".codex") || s.contains("codex/sessions") || s.contains("rollout-") {
-                    Some(ConnectorKind::Codex)
-                } else if s.contains("saoudrizwan.claude-dev") || s.contains("cline") {
-                    Some(ConnectorKind::Cline)
-                } else if s.contains(".gemini/tmp") {
-                    Some(ConnectorKind::Gemini)
-                } else if s.contains(".claude/projects")
-                    || s.ends_with(".claude")
-                    || s.ends_with(".claude.json")
-                {
-                    Some(ConnectorKind::Claude)
-                } else if s.contains("sourcegraph.amp") || s.contains("/amp/") {
-                    Some(ConnectorKind::Amp)
-                } else if s.contains(".opencode") || s.contains("/opencode/") {
-                    Some(ConnectorKind::OpenCode)
-                } else if s.contains(".aider.chat.history.md") {
-                    Some(ConnectorKind::Aider)
-                } else if s.contains("Cursor/User") || s.contains("cursor/User") {
-                    Some(ConnectorKind::Cursor)
-                } else if s.contains("com.openai.chat") || s.contains("conversations-") {
-                    Some(ConnectorKind::ChatGpt)
-                } else if s.contains(".pi/agent") || s.contains("/pi/agent/sessions") {
-                    Some(ConnectorKind::PiAgent)
-                } else {
-                    None
-                };
-
-            if let Some(kind) = tag {
-                let entry = map.entry(kind).or_insert(None);
-                *entry = match (*entry, ts) {
-                    (Some(prev), Some(cur)) => Some(prev.max(cur)),
-                    (None, Some(cur)) => Some(cur),
-                    _ => *entry,
-                };
-            }
-        }
-    }
-    map.into_iter().collect()
 }
 
 pub mod persist {
@@ -1099,8 +1093,17 @@ mod tests {
         std::fs::create_dir_all(chatgpt.parent().unwrap()).unwrap();
         std::fs::write(&chatgpt, "{}").unwrap();
 
+        // roots are needed for classify_paths now
+        let roots = vec![
+            (ConnectorKind::Codex, tmp.path().join(".codex")),
+            (ConnectorKind::Claude, tmp.path().join("project")),
+            (ConnectorKind::Aider, tmp.path().join("repo")),
+            (ConnectorKind::Cursor, tmp.path().join("Cursor/User")),
+            (ConnectorKind::ChatGpt, tmp.path().join("Library/Application Support/com.openai.chat")),
+        ];
+
         let paths = vec![codex.clone(), claude.clone(), aider, cursor, chatgpt];
-        let classified = classify_paths(paths);
+        let classified = classify_paths(paths, &roots);
 
         let kinds: std::collections::HashSet<_> = classified.iter().map(|(k, _)| *k).collect();
         assert!(kinds.contains(&ConnectorKind::Codex));
@@ -1180,9 +1183,13 @@ mod tests {
         let storage = std::sync::Arc::new(std::sync::Mutex::new(storage));
         let t_index = std::sync::Arc::new(std::sync::Mutex::new(t_index));
 
+        // Need roots for reindex_paths
+        let roots = vec![(ConnectorKind::Amp, amp_dir)];
+
         reindex_paths(
             &opts,
             vec![amp_file.clone()],
+            &roots,
             state.clone(),
             storage.clone(),
             t_index.clone(),
@@ -1288,6 +1295,7 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         reindex_paths(
             &opts,
             vec![amp_file],
+            &[(ConnectorKind::Amp, amp_dir)],
             state.clone(),
             storage.clone(),
             t_index.clone(),
