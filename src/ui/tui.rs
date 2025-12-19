@@ -62,6 +62,17 @@ pub fn format_time_short(ms: i64) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
+fn split_editor_command(editor: &str) -> (String, Vec<String>) {
+    let trimmed = editor.trim();
+    if trimmed.is_empty() {
+        return ("vi".to_string(), Vec::new());
+    }
+    match shell_words::split(trimmed) {
+        Ok(parts) if !parts.is_empty() => (parts[0].clone(), parts[1..].to_vec()),
+        _ => (trimmed.to_string(), Vec::new()),
+    }
+}
+
 /// Format time filter range as readable chip text.
 fn format_time_chip(from: Option<i64>, to: Option<i64>) -> String {
     match (from, to) {
@@ -2572,6 +2583,7 @@ pub fn run_tui(
     let mut peek_badge_until: Option<Instant> = None;
     let mut help_scroll: u16 = 0;
     let editor_cmd = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+    let (editor_bin, editor_args) = split_editor_command(&editor_cmd);
     let editor_line_flag = std::env::var("EDITOR_LINE_FLAG").unwrap_or_else(|_| "+".into());
     let mut time_preset_idx: usize = 0;
 
@@ -4535,13 +4547,15 @@ pub fn run_tui(
                                 let editor = std::env::var("EDITOR")
                                     .or_else(|_| std::env::var("VISUAL"))
                                     .unwrap_or_else(|_| "code".to_string());
+                                let (editor_bin, editor_args) = split_editor_command(&editor);
                                 // Exit raw mode
                                 disable_raw_mode().ok();
                                 execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)
                                     .ok();
                                 for hit in &selected_hits {
-                                    let mut cmd = StdCommand::new(&editor);
-                                    if editor == "code" {
+                                    let mut cmd = StdCommand::new(&editor_bin);
+                                    cmd.args(&editor_args);
+                                    if editor_bin == "code" {
                                         if let Some(ln) = hit.line_number {
                                             cmd.arg("--goto")
                                                 .arg(format!("{}:{}", hit.source_path, ln));
@@ -4556,8 +4570,11 @@ pub fn run_tui(
                                 execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
                                     .ok();
                                 enable_raw_mode().ok();
-                                status =
-                                    format!("Opened {} files in {}", selected_hits.len(), editor);
+                                status = format!(
+                                    "Opened {} files in {}",
+                                    selected_hits.len(),
+                                    editor_bin
+                                );
                                 selected.clear();
                                 open_confirm_armed = false;
                             }
@@ -4918,26 +4935,31 @@ pub fn run_tui(
                                     "nano".to_string()
                                 });
 
+                            let (editor_bin, editor_args) = split_editor_command(&editor);
                             // Exit raw mode for GUI editors (code) or TUI editors
                             disable_raw_mode().ok();
                             execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture).ok();
 
                             // Build command with optional line number
-                            let mut cmd = StdCommand::new(&editor);
-                            if editor == "code" {
+                            let mut cmd = StdCommand::new(&editor_bin);
+                            cmd.args(&editor_args);
+                            if editor_bin == "code" {
                                 // VS Code: code --goto file:line
                                 if let Some(ln) = hit.line_number {
                                     cmd.arg("--goto").arg(format!("{path}:{ln}"));
                                 } else {
                                     cmd.arg(path);
                                 }
-                            } else if editor == "vim" || editor == "vi" || editor == "nvim" {
+                            } else if editor_bin == "vim"
+                                || editor_bin == "vi"
+                                || editor_bin == "nvim"
+                            {
                                 // Vim: vim +line file
                                 if let Some(ln) = hit.line_number {
                                     cmd.arg(format!("+{ln}"));
                                 }
                                 cmd.arg(path);
-                            } else if editor == "nano" {
+                            } else if editor_bin == "nano" {
                                 // Nano: nano +line file
                                 if let Some(ln) = hit.line_number {
                                     cmd.arg(format!("+{ln}"));
@@ -4955,9 +4977,9 @@ pub fn run_tui(
                             enable_raw_mode().ok();
 
                             status = if result.map(|s| s.success()).unwrap_or(false) {
-                                format!("Opened {path} in {editor}")
+                                format!("Opened {path} in {editor_bin}")
                             } else {
-                                format!("✗ Failed to open in {editor}")
+                                format!("✗ Failed to open in {editor_bin}")
                             };
                             show_detail_modal = false;
                             modal_scroll = 0;
@@ -5437,13 +5459,15 @@ pub fn run_tui(
                                 let editor = std::env::var("EDITOR")
                                     .or_else(|_| std::env::var("VISUAL"))
                                     .unwrap_or_else(|_| "code".to_string());
+                                let (editor_bin, editor_args) = split_editor_command(&editor);
                                 // Exit raw mode
                                 disable_raw_mode().ok();
                                 execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)
                                     .ok();
                                 for hit in &selected_hits {
-                                    let mut cmd = StdCommand::new(&editor);
-                                    if editor == "code" {
+                                    let mut cmd = StdCommand::new(&editor_bin);
+                                    cmd.args(&editor_args);
+                                    if editor_bin == "code" {
                                         if let Some(ln) = hit.line_number {
                                             cmd.arg("--goto")
                                                 .arg(format!("{}:{}", hit.source_path, ln));
@@ -5458,8 +5482,11 @@ pub fn run_tui(
                                 execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
                                     .ok();
                                 enable_raw_mode().ok();
-                                status =
-                                    format!("Opened {} files in {}", selected_hits.len(), editor);
+                                status = format!(
+                                    "Opened {} files in {}",
+                                    selected_hits.len(),
+                                    editor_bin
+                                );
                                 selected.clear();
                                 open_confirm_armed = false;
                             }
@@ -5720,7 +5747,8 @@ pub fn run_tui(
                                 // User committed to viewing result in editor - save query to history
                                 save_query_to_history(&query, &mut query_history, history_cap);
                                 let path = &hit.source_path;
-                                let mut cmd = StdCommand::new(&editor_cmd);
+                                let mut cmd = StdCommand::new(&editor_bin);
+                                cmd.args(&editor_args);
                                 if let Some(line) = hit.line_number {
                                     cmd.arg(format!("{editor_line_flag}{line}"));
                                 }
