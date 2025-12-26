@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use std::cell::RefCell;
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -21,7 +22,12 @@ use tokio::task::JoinHandle;
 
 use rusqlite::Connection;
 
+use crate::search::canonicalize::canonicalize_for_embedding;
+use crate::search::embedder::Embedder;
 use crate::search::tantivy::fields_from_schema;
+use crate::search::vector_index::{
+    SemanticFilter, SemanticFilterMaps, VectorIndex, VectorSearchResult,
+};
 
 use crate::sources::provenance::SourceFilter;
 
@@ -35,6 +41,28 @@ pub struct SearchFilters {
     #[serde(skip_serializing_if = "SourceFilter::is_all")]
     pub source_filter: SourceFilter,
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    #[default]
+    Lexical,
+    Semantic,
+    Hybrid,
+}
+
+impl SearchMode {
+    pub fn next(self) -> Self {
+        match self {
+            SearchMode::Lexical => SearchMode::Semantic,
+            SearchMode::Semantic => SearchMode::Hybrid,
+            SearchMode::Hybrid => SearchMode::Lexical,
+        }
+    }
+}
+
+const RRF_K: f32 = 60.0;
+const HYBRID_CANDIDATE_MULTIPLIER: usize = 3;
 
 // ============================================================================
 // Query Explanation types (--explain flag support)
@@ -602,6 +630,178 @@ pub struct SearchResult {
     pub suggestions: Vec<QuerySuggestion>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SearchHitKey {
+    source_id: String,
+    source_path: String,
+    line_number: Option<usize>,
+    created_at: Option<i64>,
+    content_hash: u64,
+}
+
+impl SearchHitKey {
+    fn from_hit(hit: &SearchHit) -> Self {
+        Self {
+            source_id: hit.source_id.clone(),
+            source_path: hit.source_path.clone(),
+            line_number: hit.line_number,
+            created_at: hit.created_at,
+            content_hash: stable_content_hash(&hit.content),
+        }
+    }
+}
+
+impl Ord for SearchHitKey {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.source_id
+            .cmp(&other.source_id)
+            .then_with(|| self.source_path.cmp(&other.source_path))
+            .then_with(|| self.line_number.cmp(&other.line_number))
+            .then_with(|| self.created_at.cmp(&other.created_at))
+            .then_with(|| self.content_hash.cmp(&other.content_hash))
+    }
+}
+
+impl PartialOrd for SearchHitKey {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct HybridScore {
+    rrf: f32,
+    lexical_rank: Option<usize>,
+    semantic_rank: Option<usize>,
+    lexical_score: Option<f32>,
+    semantic_score: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct FusedHit {
+    key: SearchHitKey,
+    score: HybridScore,
+    hit: SearchHit,
+}
+
+fn stable_content_hash(content: &str) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut hash = FNV_OFFSET;
+    for byte in content.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Fuse lexical + semantic hits using Reciprocal Rank Fusion (RRF).
+/// Applies deterministic tie-breaking and returns the requested page slice.
+pub fn rrf_fuse_hits(
+    lexical: &[SearchHit],
+    semantic: &[SearchHit],
+    limit: usize,
+    offset: usize,
+) -> Vec<SearchHit> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut scores: HashMap<SearchHitKey, HybridScore> = HashMap::new();
+    let mut hits: HashMap<SearchHitKey, SearchHit> = HashMap::new();
+
+    for (rank, hit) in lexical.iter().enumerate() {
+        let key = SearchHitKey::from_hit(hit);
+        let entry = scores.entry(key.clone()).or_default();
+        entry.rrf += 1.0 / (RRF_K + rank as f32 + 1.0);
+        entry.lexical_rank = Some(rank);
+        entry.lexical_score = Some(hit.score);
+        // Prefer lexical hit details (snippets highlight query terms).
+        hits.insert(key, hit.clone());
+    }
+
+    for (rank, hit) in semantic.iter().enumerate() {
+        let key = SearchHitKey::from_hit(hit);
+        let entry = scores.entry(key.clone()).or_default();
+        entry.rrf += 1.0 / (RRF_K + rank as f32 + 1.0);
+        entry.semantic_rank = Some(rank);
+        entry.semantic_score = Some(hit.score);
+        hits.entry(key).or_insert_with(|| hit.clone());
+    }
+
+    let mut fused: Vec<FusedHit> = Vec::with_capacity(scores.len());
+    for (key, score) in scores {
+        if let Some(hit) = hits.remove(&key) {
+            fused.push(FusedHit { key, score, hit });
+        }
+    }
+
+    fused.sort_by(|a, b| {
+        b.score
+            .rrf
+            .total_cmp(&a.score.rrf)
+            .then_with(|| {
+                let a_both = a.score.lexical_rank.is_some() && a.score.semantic_rank.is_some();
+                let b_both = b.score.lexical_rank.is_some() && b.score.semantic_rank.is_some();
+                match (b_both, a_both) {
+                    (true, false) => CmpOrdering::Greater,
+                    (false, true) => CmpOrdering::Less,
+                    _ => CmpOrdering::Equal,
+                }
+            })
+            .then_with(|| a.key.cmp(&b.key))
+    });
+
+    let start = offset.min(fused.len());
+    let end = start.saturating_add(limit).min(fused.len());
+    let mut results = Vec::with_capacity(end.saturating_sub(start));
+    for mut entry in fused.into_iter().skip(start).take(limit) {
+        entry.hit.score = entry.score.rrf;
+        results.push(entry.hit);
+    }
+    results
+}
+
+struct QueryCache {
+    embedder_id: String,
+    embeddings: LruCache<String, Vec<f32>>,
+}
+
+impl QueryCache {
+    fn new(embedder_id: &str, capacity: NonZeroUsize) -> Self {
+        Self {
+            embedder_id: embedder_id.to_string(),
+            embeddings: LruCache::new(capacity),
+        }
+    }
+
+    fn get_or_embed(&mut self, embedder: &dyn Embedder, canonical: &str) -> Result<Vec<f32>> {
+        if self.embedder_id != embedder.id() {
+            self.embedder_id = embedder.id().to_string();
+            self.embeddings.clear();
+        }
+
+        if let Some(hit) = self.embeddings.get(canonical) {
+            return Ok(hit.clone());
+        }
+
+        let embedding = embedder
+            .embed(canonical)
+            .map_err(|e| anyhow!("embedding failed: {e}"))?;
+        self.embeddings
+            .put(canonical.to_string(), embedding.clone());
+        Ok(embedding)
+    }
+}
+
+struct SemanticSearchState {
+    embedder: Arc<dyn Embedder>,
+    index: VectorIndex,
+    filter_maps: SemanticFilterMaps,
+    roles: Option<HashSet<u8>>,
+    query_cache: QueryCache,
+}
+
 pub struct SearchClient {
     reader: Option<(IndexReader, crate::search::tantivy::Fields)>,
     sqlite: Option<Connection>,
@@ -615,6 +815,7 @@ pub struct SearchClient {
     _shared_filters: Arc<Mutex<()>>, // placeholder lock to ensure Send/Sync; future warm prefill state
     metrics: Metrics,
     cache_namespace: String,
+    semantic: Mutex<Option<SemanticSearchState>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -830,13 +1031,14 @@ thread_local! {
 }
 
 fn sanitize_query(raw: &str) -> String {
-    // Replace any character that is not alphanumeric or asterisk with a space.
+    // Replace any character that is not alphanumeric, asterisk, or double quote with a space.
     // Asterisks are preserved for wildcard query support (*foo, foo*, *bar*).
+    // Double quotes are preserved for phrase query support ("exact phrase").
     // This ensures that the input tokens match how SimpleTokenizer splits content.
     // e.g. "c++" -> "c  ", "foo.bar" -> "foo bar", "*config*" -> "*config*"
     raw.chars()
         .map(|c| {
-            if c.is_alphanumeric() || c == '*' {
+            if c.is_alphanumeric() || c == '*' || c == '"' {
                 c
             } else {
                 ' '
@@ -1320,6 +1522,15 @@ fn is_tool_invocation_noise(content: &str) -> bool {
     false
 }
 
+fn snippet_from_content(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.chars().count() <= 200 {
+        return trimmed.to_string();
+    }
+    let preview: String = trimmed.chars().take(200).collect();
+    format!("{preview}...")
+}
+
 /// Deduplicate search hits by (source_id, content), keeping only the highest-scored hit
 /// for each unique content within a source.
 ///
@@ -1408,6 +1619,7 @@ impl SearchClient {
             _shared_filters: shared_filters,
             metrics,
             cache_namespace,
+            semantic: Mutex::new(None),
         }))
     }
 
@@ -1513,6 +1725,185 @@ impl SearchClient {
         Ok(Vec::new())
     }
 
+    pub fn set_semantic_context(
+        &self,
+        embedder: Arc<dyn Embedder>,
+        index: VectorIndex,
+        filter_maps: SemanticFilterMaps,
+        roles: Option<HashSet<u8>>,
+    ) -> Result<()> {
+        let header = index.header();
+        let embedder_id = header.embedder_id.clone();
+        let dimension = header.dimension as usize;
+        if embedder_id != embedder.id() {
+            bail!(
+                "embedder mismatch: index uses {}, embedder is {}",
+                embedder_id,
+                embedder.id()
+            );
+        }
+        if dimension != embedder.dimension() {
+            bail!(
+                "embedder dimension mismatch: index uses {}, embedder is {}",
+                dimension,
+                embedder.dimension()
+            );
+        }
+
+        let capacity = NonZeroUsize::new(100).ok_or_else(|| anyhow!("invalid cache size"))?;
+        let mut state_guard = self
+            .semantic
+            .lock()
+            .map_err(|_| anyhow!("semantic lock poisoned"))?;
+        *state_guard = Some(SemanticSearchState {
+            embedder,
+            index,
+            filter_maps,
+            roles,
+            query_cache: QueryCache::new(embedder_id.as_str(), capacity),
+        });
+        Ok(())
+    }
+
+    pub fn clear_semantic_context(&self) -> Result<()> {
+        let mut guard = self
+            .semantic
+            .lock()
+            .map_err(|_| anyhow!("semantic lock poisoned"))?;
+        *guard = None;
+        Ok(())
+    }
+
+    pub fn search_semantic(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let canonical = canonicalize_for_embedding(query);
+        if canonical.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut guard = self
+            .semantic
+            .lock()
+            .map_err(|_| anyhow!("semantic lock poisoned"))?;
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("semantic search unavailable (no embedder or vector index)"))?;
+
+        let embedding = state
+            .query_cache
+            .get_or_embed(state.embedder.as_ref(), &canonical)?;
+        let mut semantic_filter =
+            SemanticFilter::from_search_filters(&filters, &state.filter_maps)?;
+        if let Some(roles) = state.roles.clone() {
+            semantic_filter = semantic_filter.with_roles(Some(roles));
+        }
+
+        let fetch = limit.saturating_add(offset);
+        if fetch == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut results =
+            state
+                .index
+                .search_top_k_collapsed(&embedding, fetch, Some(&semantic_filter))?;
+        if offset > 0 {
+            results = results.into_iter().skip(offset).collect();
+        }
+
+        self.hydrate_semantic_hits(&results)
+    }
+
+    fn hydrate_semantic_hits(&self, results: &[VectorSearchResult]) -> Result<Vec<SearchHit>> {
+        if results.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self
+            .sqlite
+            .as_ref()
+            .ok_or_else(|| anyhow!("semantic search requires database connection"))?;
+
+        let mut placeholders = String::new();
+        let mut params: Vec<i64> = Vec::with_capacity(results.len());
+        for (idx, result) in results.iter().enumerate() {
+            if idx > 0 {
+                placeholders.push(',');
+            }
+            placeholders.push('?');
+            params.push(i64::try_from(result.message_id)?);
+        }
+
+        let sql = format!(
+            "SELECT m.id, m.content, m.created_at, m.idx, m.role, c.title, c.source_path, c.source_id, c.origin_host, a.slug, w.path, COALESCE(s.kind, 'local')
+             FROM messages m
+             JOIN conversations c ON m.conversation_id = c.id
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             LEFT JOIN sources s ON c.source_id = s.id
+             WHERE m.id IN ({placeholders})"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(params.iter()),
+            |row: &rusqlite::Row| -> rusqlite::Result<(u64, SearchHit)> {
+                let message_id: i64 = row.get(0)?;
+                let content: String = row.get(1)?;
+                let created_at: Option<i64> = row.get(2)?;
+                let idx: Option<i64> = row.get(3)?;
+                let title: Option<String> = row.get(5)?;
+                let source_path: String = row.get(6)?;
+                let source_id: Option<String> = row.get(7)?;
+                let origin_host: Option<String> = row.get(8)?;
+                let agent: String = row.get(9)?;
+                let workspace: Option<String> = row.get(10)?;
+                let origin_kind: String = row.get(11)?;
+
+                let line_number = idx.map(|i| (i + 1) as usize);
+                let snippet = snippet_from_content(&content);
+
+                let hit = SearchHit {
+                    title: title.unwrap_or_else(|| "Untitled".to_string()),
+                    snippet,
+                    content,
+                    score: 0.0,
+                    source_path,
+                    agent,
+                    workspace: workspace.unwrap_or_default(),
+                    workspace_original: None,
+                    created_at,
+                    line_number,
+                    match_type: MatchType::Exact,
+                    source_id: source_id.unwrap_or_else(default_source_id),
+                    origin_kind,
+                    origin_host,
+                };
+
+                Ok((message_id as u64, hit))
+            },
+        )?;
+
+        let mut hits_by_id = HashMap::new();
+        for row in rows {
+            let (id, hit) = row?;
+            hits_by_id.insert(id, hit);
+        }
+
+        let mut ordered = Vec::new();
+        for result in results {
+            if let Some(mut hit) = hits_by_id.remove(&result.message_id) {
+                hit.score = result.score;
+                ordered.push(hit);
+            }
+        }
+
+        Ok(ordered)
+    }
+
     /// Search with automatic wildcard fallback for sparse results.
     /// If the initial search returns fewer than `sparse_threshold` results and the query
     /// doesn't already contain wildcards, automatically retry with substring wildcards (*term*).
@@ -1530,10 +1921,12 @@ impl SearchClient {
 
         // Check if we should try wildcard fallback
         let query_has_wildcards = query.contains('*');
+        let has_boolean_or_phrase = has_boolean_operators(query);
         let is_sparse = hits.len() < sparse_threshold && offset == 0;
 
-        if !is_sparse || query_has_wildcards || query.trim().is_empty() {
-            // Either we have enough results, query already has wildcards, or query is empty
+        if !is_sparse || query_has_wildcards || has_boolean_or_phrase || query.trim().is_empty() {
+            // Either we have enough results, query already has wildcards,
+            // query uses boolean/phrases, or query is empty.
             // Generate suggestions only if truly zero hits
             let suggestions = if hits.is_empty() && !query.trim().is_empty() {
                 self.generate_suggestions(query, &filters)
@@ -1598,6 +1991,59 @@ impl SearchClient {
                 suggestions,
             })
         }
+    }
+
+    /// Hybrid search that fuses lexical + semantic results with RRF.
+    pub fn search_hybrid(
+        &self,
+        lexical_query: &str,
+        semantic_query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        sparse_threshold: usize,
+    ) -> Result<SearchResult> {
+        let fetch = limit.saturating_add(offset);
+        if fetch == 0 {
+            return Ok(SearchResult {
+                hits: Vec::new(),
+                wildcard_fallback: false,
+                cache_stats: self.cache_stats(),
+                suggestions: Vec::new(),
+            });
+        }
+
+        if semantic_query.trim().is_empty() {
+            return self.search_with_fallback(
+                lexical_query,
+                filters,
+                limit,
+                offset,
+                sparse_threshold,
+            );
+        }
+
+        let candidate = fetch.saturating_mul(HYBRID_CANDIDATE_MULTIPLIER);
+        let lexical = self.search_with_fallback(
+            lexical_query,
+            filters.clone(),
+            candidate,
+            0,
+            sparse_threshold,
+        )?;
+        let semantic = self.search_semantic(semantic_query, filters, candidate, 0)?;
+        let fused = rrf_fuse_hits(&lexical.hits, &semantic, limit, offset);
+        let suggestions = if fused.is_empty() {
+            lexical.suggestions.clone()
+        } else {
+            Vec::new()
+        };
+        Ok(SearchResult {
+            hits: fused,
+            wildcard_fallback: lexical.wildcard_fallback,
+            cache_stats: lexical.cache_stats,
+            suggestions,
+        })
     }
 
     /// Generate "did-you-mean" suggestions for zero-hit queries.
@@ -2456,6 +2902,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
         };
 
         let hits = vec![SearchHit {
@@ -2925,6 +3372,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
         };
 
         let hits = client.search("*handler", SearchFilters::default(), 5, 0)?;
@@ -3039,6 +3487,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -3092,6 +3541,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -3141,6 +3591,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
         };
 
         client.metrics.inc_cache_hits();
@@ -3172,6 +3623,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -3232,6 +3684,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
         };
 
         // Large content to exceed byte cap quickly
@@ -4005,6 +4458,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
+            semantic: Mutex::new(None),
         };
 
         let result = client.search_with_fallback("ghost", SearchFilters::default(), 5, 0, 3)?;
@@ -4079,6 +4533,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
+            semantic: Mutex::new(None),
         };
 
         let result = client.search_with_fallback("ghost", SearchFilters::default(), 5, 10, 3)?;
@@ -4113,6 +4568,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
+            semantic: Mutex::new(None),
         };
 
         let mut filters = SearchFilters::default();
@@ -4708,6 +5164,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
         };
 
         let filters_empty = SearchFilters::default();
@@ -5487,6 +5944,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
         };
 
         // Initial metrics should be zero
@@ -5522,6 +5980,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
         };
 
         let filters1 = SearchFilters::default();

@@ -6320,7 +6320,7 @@ fn format_as_markdown(
     md.push('\n');
 
     if let Some(ts) = start_ts
-        && let Some(dt) = Utc.timestamp_opt(ts, 0).single()
+        && let Some(dt) = Utc.timestamp_millis_opt(ts).single()
     {
         md.push_str(&format!(
             "\n*Started: {}*\n",
@@ -6431,7 +6431,7 @@ fn format_as_html(
     use chrono::{TimeZone, Utc};
     let title_str = title.as_deref().unwrap_or("Conversation Export");
     let date_str = start_ts
-        .and_then(|ts| Utc.timestamp_opt(ts, 0).single())
+        .and_then(|ts| Utc.timestamp_millis_opt(ts).single())
         .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_default();
 
@@ -6760,14 +6760,14 @@ fn run_timeline(
     let (start_ts, end_ts) = if today {
         let start_of_day = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
         let local_start = Local.from_local_datetime(&start_of_day).single().unwrap();
-        (local_start.timestamp(), now.timestamp())
+        (local_start.timestamp_millis(), now.timestamp_millis())
     } else {
         let start = since
             .and_then(parse_datetime_flexible)
-            .unwrap_or_else(|| (now - chrono::Duration::days(7)).timestamp());
+            .unwrap_or_else(|| (now - chrono::Duration::days(7)).timestamp_millis());
         let end = until
             .and_then(parse_datetime_flexible)
-            .unwrap_or_else(|| now.timestamp());
+            .unwrap_or_else(|| now.timestamp_millis());
         (start, end)
     };
 
@@ -6922,7 +6922,7 @@ fn run_timeline(
                 ) in &sessions
                 {
                     let dt = Utc
-                        .timestamp_opt(*started, 0)
+                        .timestamp_millis_opt(*started)
                         .single()
                         .unwrap_or_else(Utc::now);
                     let key = match group_by {
@@ -6955,11 +6955,11 @@ fn run_timeline(
         );
     } else {
         let start_dt = Utc
-            .timestamp_opt(start_ts, 0)
+            .timestamp_millis_opt(start_ts)
             .single()
             .unwrap_or_else(Utc::now);
         let end_dt = Utc
-            .timestamp_opt(end_ts, 0)
+            .timestamp_millis_opt(end_ts)
             .single()
             .unwrap_or_else(Utc::now);
 
@@ -6991,7 +6991,7 @@ fn run_timeline(
         ) in &sessions
         {
             let dt = Utc
-                .timestamp_opt(*started, 0)
+                .timestamp_millis_opt(*started)
                 .single()
                 .unwrap_or_else(Utc::now);
 
@@ -8394,15 +8394,16 @@ fn run_mappings_test(source_name: &str, path: &str, agent: Option<&str>) -> CliR
 fn parse_datetime_flexible(s: &str) -> Option<i64> {
     use chrono::{Local, NaiveDate, TimeZone};
 
+    // Returns timestamp in milliseconds to match SQLite storage format
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.timestamp());
+        return Some(dt.timestamp_millis());
     }
 
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d")
         && let Some(dt) = date.and_hms_opt(0, 0, 0)
         && let Some(local) = Local.from_local_datetime(&dt).single()
     {
-        return Some(local.timestamp());
+        return Some(local.timestamp_millis());
     }
 
     let now = Local::now();
@@ -8412,7 +8413,7 @@ fn parse_datetime_flexible(s: &str) -> Option<i64> {
             Local
                 .from_local_datetime(&start)
                 .single()
-                .map(|d| d.timestamp())
+                .map(|d| d.timestamp_millis())
         }
         "yesterday" => {
             let yesterday = (now - chrono::Duration::days(1)).date_naive();
@@ -8420,18 +8421,18 @@ fn parse_datetime_flexible(s: &str) -> Option<i64> {
             Local
                 .from_local_datetime(&start)
                 .single()
-                .map(|d| d.timestamp())
+                .map(|d| d.timestamp_millis())
         }
         _ => {
             if let Some(days_str) = s.strip_suffix('d')
                 && let Ok(days) = days_str.parse::<i64>()
             {
-                return Some((now - chrono::Duration::days(days)).timestamp());
+                return Some((now - chrono::Duration::days(days)).timestamp_millis());
             }
             if let Some(hours_str) = s.strip_suffix('h')
                 && let Ok(hours) = hours_str.parse::<i64>()
             {
-                return Some((now - chrono::Duration::hours(hours)).timestamp());
+                return Some((now - chrono::Duration::hours(hours)).timestamp_millis());
             }
             None
         }

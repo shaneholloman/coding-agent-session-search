@@ -77,18 +77,26 @@ impl Connector for AmpConnector {
         let mut convs = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
+        let looks_like_root = |path: &PathBuf| {
+            path.file_name()
+                .is_some_and(|n| n.to_str().unwrap_or("").contains("amp"))
+                || std::fs::read_dir(path)
+                    .map(|mut d| d.any(|e| e.ok().is_some_and(|e| is_amp_log_file(&e.path()))))
+                    .unwrap_or(false)
+        };
+
         // allow tests to override via ctx.data_dir
-        let roots = if ctx
-            .data_dir
-            .file_name()
-            .is_some_and(|n| n.to_str().unwrap_or("").contains("amp"))
-            || std::fs::read_dir(&ctx.data_dir)
-                .map(|mut d| d.any(|e| e.ok().is_some_and(|e| is_amp_log_file(&e.path()))))
-                .unwrap_or(false)
-        {
-            vec![ctx.data_dir.clone()]
+        let roots = if ctx.use_default_detection() {
+            if looks_like_root(&ctx.data_dir) {
+                vec![ctx.data_dir.clone()]
+            } else {
+                Self::candidate_roots()
+            }
         } else {
-            Self::candidate_roots()
+            if !looks_like_root(&ctx.data_dir) {
+                return Ok(Vec::new());
+            }
+            vec![ctx.data_dir.clone()]
         };
 
         for root in roots {
@@ -267,11 +275,45 @@ fn is_amp_log_file(path: &std::path::Path) -> bool {
     }
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
         let stem_lower = stem.to_ascii_lowercase();
-        return stem_lower.contains("thread")
+        // Match known patterns: thread, conversation, chat
+        if stem_lower.contains("thread")
             || stem_lower.contains("conversation")
-            || stem_lower.contains("chat");
+            || stem_lower.contains("chat")
+        {
+            return true;
+        }
+        // Match Amp's T-{uuid}.json format (e.g., T-01872a67-152b-46af-a1af-4de6fce3d2b3.json)
+        if stem_lower.starts_with("t-") && looks_like_uuid(&stem[2..]) {
+            return true;
+        }
+    }
+    // Also match any .json file in a "threads" directory
+    if let Some(parent) = path.parent()
+        && let Some(dir_name) = parent.file_name().and_then(|n| n.to_str())
+        && dir_name == "threads"
+    {
+        return true;
     }
     false
+}
+
+/// Check if a string looks like a UUID (8-4-4-4-12 hex pattern)
+fn looks_like_uuid(s: &str) -> bool {
+    // UUID format: 8-4-4-4-12 (32 hex chars + 4 dashes = 36 chars)
+    if s.len() != 36 {
+        return false;
+    }
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 5 {
+        return false;
+    }
+    let expected_lens = [8, 4, 4, 4, 12];
+    for (part, &expected_len) in parts.iter().zip(expected_lens.iter()) {
+        if part.len() != expected_len || !part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -336,6 +378,53 @@ mod tests {
         assert!(!is_amp_log_file(std::path::Path::new("config.json")));
         assert!(!is_amp_log_file(std::path::Path::new("settings.json")));
         assert!(!is_amp_log_file(std::path::Path::new("data.json")));
+    }
+
+    #[test]
+    fn is_amp_log_file_matches_uuid_format() {
+        // Amp stores files as T-{uuid}.json
+        assert!(is_amp_log_file(std::path::Path::new(
+            "T-01872a67-152b-46af-a1af-4de6fce3d2b3.json"
+        )));
+        assert!(is_amp_log_file(std::path::Path::new(
+            "t-abcdef12-3456-7890-abcd-ef1234567890.json"
+        )));
+    }
+
+    #[test]
+    fn is_amp_log_file_rejects_invalid_uuid() {
+        // T- prefix but not a valid UUID
+        assert!(!is_amp_log_file(std::path::Path::new("T-not-a-uuid.json")));
+        assert!(!is_amp_log_file(std::path::Path::new("T-12345.json")));
+    }
+
+    #[test]
+    fn is_amp_log_file_matches_threads_directory() {
+        // Any .json in a "threads" directory should match
+        assert!(is_amp_log_file(std::path::Path::new(
+            "/home/user/.local/share/amp/threads/random-file.json"
+        )));
+        assert!(is_amp_log_file(std::path::Path::new(
+            "threads/any-name.json"
+        )));
+    }
+
+    #[test]
+    fn looks_like_uuid_valid_uuids() {
+        assert!(looks_like_uuid("01872a67-152b-46af-a1af-4de6fce3d2b3"));
+        assert!(looks_like_uuid("abcdef12-3456-7890-abcd-ef1234567890"));
+        assert!(looks_like_uuid("00000000-0000-0000-0000-000000000000"));
+        assert!(looks_like_uuid("ABCDEF12-3456-7890-ABCD-EF1234567890"));
+    }
+
+    #[test]
+    fn looks_like_uuid_invalid() {
+        assert!(!looks_like_uuid("not-a-uuid"));
+        assert!(!looks_like_uuid("12345"));
+        assert!(!looks_like_uuid(""));
+        assert!(!looks_like_uuid("01872a67-152b-46af-a1af-4de6fce3d2b")); // too short
+        assert!(!looks_like_uuid("01872a67-152b-46af-a1af-4de6fce3d2b33")); // too long
+        assert!(!looks_like_uuid("0187zzzz-152b-46af-a1af-4de6fce3d2b3")); // non-hex
     }
 
     // =====================================================
