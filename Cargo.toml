@@ -51,6 +51,9 @@ syntect = "*"
 itertools = "*"
 crc32fast = "*"
 unicode-normalization = "*"
+half = "*"
+memmap2 = "*"
+fastembed = { version = "*", default-features = false, features = ["ort-download-binaries"] }
 
 # Crypto for ChatGPT encrypted conversations
 aes-gcm = "0.10"

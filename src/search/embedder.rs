@@ -66,7 +66,7 @@ pub type EmbedderResult<T> = Result<T, EmbedderError>;
 /// # Implementors
 ///
 /// - `HashEmbedder`: FNV-1a feature hashing (always available, ~256 dimensions)
-/// - `FastEmbedEmbedder`: MiniLM via FastEmbed (requires model download, 384 dimensions)
+/// - `FastEmbedder`: MiniLM via FastEmbed (requires model download, 384 dimensions)
 ///
 /// # Thread Safety
 ///

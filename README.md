@@ -61,7 +61,7 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 - **Fragmented storage**: Each agent stores data differently—JSONL files, SQLite databases, markdown logs, proprietary JSON formats
 - **No cross-agent visibility**: Solutions discovered in Cursor are invisible when you're using Claude Code
 - **Lost context**: That brilliant debugging session from two weeks ago? Good luck finding it by scrolling through files
-- **No semantic search**: File-based grep doesn't understand code structure or natural language queries
+- **No semantic search by default**: File-based grep doesn't understand natural language queries; cass can add optional local ML search when model files are installed
 
 ### The Solution
 
@@ -88,6 +88,17 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 - **Edge N-Gram Indexing**: We frontload the work by pre-computing prefix matches (e.g., "cal" -> "calculate") during indexing, trading disk space for O(1) lookup speed at query time.
 - **Smart Tokenization**: Handles `snake_case` ("my_var" matches "my" and "var"), hyphenated terms, and code symbols (`c++`, `foo.bar`) correctly.
 - **Zero-Stall Updates**: The background indexer commits changes atomically; `reader.reload()` ensures new messages appear in the search bar immediately without restarting.
+
+### 🧠 Optional Semantic Search (Local, No Network)
+- **Local-only**: Uses a MiniLM model via FastEmbed; no cloud calls.
+- **Manual install**: Place model files under your data directory (see below); cass will not auto-download.
+- **Required files** (all must be present):
+  - `model.onnx`
+  - `tokenizer.json`
+  - `config.json`
+  - `special_tokens_map.json`
+  - `tokenizer_config.json`
+- **Vector index**: Stored as `vector_index/index-minilm-384.cvvi` in the data directory.
 
 ### 🎯 Advanced Search Features
 - **Wildcard Patterns**: Full glob-style pattern support:
@@ -1818,13 +1829,15 @@ let pending_batches: Vec<_> = connector_factories
 - `~/.local/share/coding-agent-search/` (or platform equivalent):
   - `agent_search.db` - SQLite database
   - `tantivy_index/` - Full-text search index
+  - `models/all-MiniLM-L6-v2/` - Optional local semantic model files
+  - `vector_index/` - Optional semantic vector index (`.cvvi`)
   - `tui_state.json` - UI preferences
   - `watch_state.json` - Incremental index state
   - `cass.log` - Rotating log file
 
 **What `cass` NEVER Does**:
 - Modify source agent files (strictly read-only)
-- Make network requests (except optional update checks)
+- Make network requests (except optional update checks or explicit user-initiated model installs)
 - Execute code from indexed content
 - Access files outside known agent directories
 

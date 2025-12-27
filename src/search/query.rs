@@ -2768,7 +2768,10 @@ fn filters_fingerprint(filters: &SearchFilters) -> String {
         parts.push(format!("to:{t}"));
     }
     // Include source_filter in cache key (P3.1)
-    if !matches!(filters.source_filter, crate::sources::provenance::SourceFilter::All) {
+    if !matches!(
+        filters.source_filter,
+        crate::sources::provenance::SourceFilter::All
+    ) {
         parts.push(format!("src:{:?}", filters.source_filter));
     }
     // Include session_paths in cache key (for chained searches)
@@ -6325,11 +6328,19 @@ mod tests {
 
         // Now filter to only sessions A and C
         let mut filters = SearchFilters::default();
-        filters.session_paths.insert(paths[0].to_string_lossy().to_string());
-        filters.session_paths.insert(paths[2].to_string_lossy().to_string());
+        filters
+            .session_paths
+            .insert(paths[0].to_string_lossy().to_string());
+        filters
+            .session_paths
+            .insert(paths[2].to_string_lossy().to_string());
 
         let hits_filtered = client.search("needle", filters, 10, 0)?;
-        assert_eq!(hits_filtered.len(), 2, "Should find only 2 sessions (A and C)");
+        assert_eq!(
+            hits_filtered.len(),
+            2,
+            "Should find only 2 sessions (A and C)"
+        );
 
         // Verify the correct sessions are returned
         let filtered_paths: HashSet<&str> = hits_filtered
