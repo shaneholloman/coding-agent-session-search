@@ -1532,7 +1532,25 @@ fn evidence_id(candidate: &PackCandidate) -> String {
     hasher_input.push('\n');
     hasher_input.push_str(&candidate.span_hash);
     let hash = blake3::hash(hasher_input.as_bytes());
-    format!("ev_{}", &hash.to_hex()[..16])
+    encoded_evidence_id(hash.as_bytes())
+}
+
+fn encoded_evidence_id(hash: &[u8; 32]) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut id = String::with_capacity(55);
+    id.push_str("ev_");
+    // RFC 4648 base32, without '=' padding: the digest is always 256 bits.
+    // Keep the entire hash, including its final bit in the last character.
+    for chunk in hash.chunks(5) {
+        let mut block = [0u8; 8];
+        block[3..3 + chunk.len()].copy_from_slice(chunk);
+        let word = u64::from_be_bytes(block);
+        for shift in (0..chunk.len() * 8).step_by(5) {
+            let digit = ((word >> (35 - shift)) & 31) as usize;
+            id.push(char::from(ALPHABET[digit]));
+        }
+    }
+    id
 }
 
 pub fn render_answer_pack(
@@ -2979,6 +2997,40 @@ mod tests {
             }
             assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         }
+    }
+
+    #[test]
+    fn evidence_ids_encode_the_full_digest_as_base32() {
+        // Independent known answers from Python's base64.b32encode, with
+        // padding removed because these IDs always carry a 32-byte digest.
+        for (hash, expected) in [
+            (
+                [0u8; 32],
+                "ev_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+            (
+                [255u8; 32],
+                "ev_777777777777777777777777777777777777777777777777777Q",
+            ),
+            (
+                std::array::from_fn(|index| index as u8),
+                "ev_AAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPQ",
+            ),
+            (
+                std::array::from_fn(|index| (31 - index) as u8),
+                "ev_D4PB2HA3DIMRQFYWCUKBGEQRCAHQ4DIMBMFASCAHAYCQIAYCAEAA",
+            ),
+        ] {
+            assert_eq!(encoded_evidence_id(&hash), expected);
+        }
+        let first = [0u8; 32];
+        let mut last_bit_changed = first;
+        last_bit_changed[31] = 1;
+        assert_ne!(
+            encoded_evidence_id(&first),
+            encoded_evidence_id(&last_bit_changed),
+            "IDs must distinguish hashes sharing their first 255 bits"
+        );
     }
 
     #[test]

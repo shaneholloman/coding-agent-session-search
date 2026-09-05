@@ -733,12 +733,33 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
             source_path.display(),
             blake3::hash(cited.as_bytes()).to_hex()
         );
+        let encoded = item["id"]
+            .as_str()
+            .expect("evidence ID")
+            .strip_prefix("ev_")
+            .expect("evidence ID prefix");
+        assert_eq!(encoded.len(), 52, "ID must carry the full 256-bit digest");
+        // Decode the emitted base32 one bit at a time, independently of the
+        // production encoder's 40-bit blocks, then compare every digest byte.
+        let mut decoded = [0u8; 32];
+        for (index, character) in encoded.bytes().enumerate() {
+            let digit = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+                .iter()
+                .position(|allowed| *allowed == character)
+                .expect("RFC 4648 base32 character") as u8;
+            for offset in 0..5 {
+                let bit_index = index * 5 + offset;
+                let bit = (digit >> (4 - offset)) & 1;
+                if bit_index < 256 {
+                    decoded[bit_index / 8] |= bit << (7 - bit_index % 8);
+                } else {
+                    assert_eq!(bit, 0, "base32 trailing pad bits must be zero");
+                }
+            }
+        }
         assert_eq!(
-            item["id"],
-            format!(
-                "ev_{}",
-                &blake3::hash(citation_core.as_bytes()).to_hex()[..16]
-            ),
+            &decoded,
+            blake3::hash(citation_core.as_bytes()).as_bytes(),
             "evidence identity must bind the actual verified source span"
         );
         assert!(citation["message_index"].is_u64());
