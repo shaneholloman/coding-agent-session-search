@@ -993,10 +993,7 @@ fn structured_pack_shortens_large_evidence_without_losing_verified_citations() {
     let full_excerpt = full["excerpt"].as_str().unwrap();
     let short_excerpt = shortened["excerpt"].as_str().unwrap();
     let evidence_tokens = 1_024 * 60 / 100;
-    let expected: String = full_excerpt
-        .chars()
-        .take(evidence_tokens * 4 - 3)
-        .collect();
+    let expected: String = full_excerpt.chars().take(evidence_tokens * 4 - 3).collect();
     assert!(full_excerpt.chars().count() > evidence_tokens * 4);
     assert_eq!(short_excerpt, format!("{expected}..."));
     assert_eq!(shortened["excerpt_truncated"], true);

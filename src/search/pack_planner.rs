@@ -946,7 +946,10 @@ pub fn plan_answer_pack(
         remaining = next_remaining;
         let candidate = &request.candidates[best_candidate.index];
 
-        let remaining_tokens = diagnostics.budget.evidence_tokens.saturating_sub(used_tokens);
+        let remaining_tokens = diagnostics
+            .budget
+            .evidence_tokens
+            .saturating_sub(used_tokens);
         if best_candidate.score.token_cost > remaining_tokens {
             let max_chars = remaining_tokens.saturating_mul(TOKEN_ESTIMATE_CHARS_PER_TOKEN);
             let retained_chars = max_chars.saturating_sub(3);
@@ -1134,16 +1137,29 @@ pub(crate) fn verify_pack_source_citations(
             let Some(message) = crate::connectors::codex::modern_codex_message(&raw) else {
                 continue;
             };
+            let mut redacted_content = None;
             for (slot, evidence_index) in matches.iter_mut().zip(&indices) {
                 let candidate = &plan.evidence[*evidence_index].candidate;
-                // The modern Codex parser trims message boundaries, while
-                // archived FAD messages can retain that whitespace. Preserve
-                // internal whitespace and require a unique normalized record.
-                if message.content == candidate.excerpt.trim()
-                    && candidate
-                        .created_at_ms
-                        .is_none_or(|created| message.created_at == Some(created))
+                if candidate
+                    .created_at_ms
+                    .is_some_and(|created| message.created_at != Some(created))
                 {
+                    continue;
+                }
+                // The modern Codex parser trims message boundaries, while
+                // archived FAD messages can retain that whitespace. Ingestion
+                // can also redact credentials before storing the message.
+                // Compare that exact transform, never the shortened excerpt;
+                // still require a unique record and hash its original bytes.
+                let excerpt = candidate.excerpt.trim();
+                let same_content = if message.content == excerpt {
+                    true
+                } else {
+                    let redacted =
+                        redacted_content.get_or_insert_with(|| redact_text(&message.content));
+                    redacted.as_ref() == excerpt
+                };
+                if same_content {
                     slot.0 += 1;
                     slot.1 = line_index + 1;
                     slot.2 = Some(blake3::hash(line));
@@ -3011,6 +3027,60 @@ mod tests {
                 assert_eq!(
                     evidence.candidate.span_hash,
                     blake3::hash(source.as_bytes()).to_hex().to_string()
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn source_citations_match_ingestion_redaction_without_ignoring_ambiguity() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("rollout-redacted.jsonl");
+        let first = format!("verifiedneedle sk-{}", "A".repeat(40));
+        let second = format!("verifiedneedle sk-{}", "B".repeat(40));
+        let archived = "verifiedneedle [REDACTED]";
+        let record = |text: &str| {
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}]
+                }
+            })
+            .to_string()
+        };
+        let raw = record(&first);
+        for (excerpt, source, timestamp, verified) in [
+            (archived, raw.clone(), None, true),
+            (first.as_str(), raw.clone(), None, true),
+            (first.as_str(), record(&second), None, false),
+            (archived, format!("{raw}\n{}", record(&second)), None, false),
+            (archived, record("different content"), None, false),
+            (archived, raw.clone(), Some(1), false),
+        ] {
+            std::fs::write(&path, &source).unwrap();
+            let mut item = candidate("redacted", "local", path.to_str().unwrap(), 10.0);
+            item.excerpt = excerpt.to_string();
+            item.created_at_ms = timestamp;
+            let mut plan = plan_answer_pack(request(vec![item])).unwrap();
+            let prepared = plan.evidence[0].excerpt.clone();
+            verify_pack_source_citations(
+                &mut plan,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+            let evidence = &plan.evidence[0];
+            assert_eq!(evidence.candidate.citation_verified, verified);
+            assert_eq!(evidence.candidate.line_start, verified.then_some(1));
+            assert_eq!(evidence.candidate.line_end, verified.then_some(1));
+            assert_eq!(evidence.candidate.excerpt, excerpt);
+            assert_eq!(evidence.excerpt, prepared);
+            assert_eq!(evidence.id, evidence_id(&evidence.candidate));
+            if verified {
+                assert_eq!(
+                    evidence.candidate.span_hash,
+                    blake3::hash(raw.as_bytes()).to_hex().to_string()
                 );
             }
             assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
