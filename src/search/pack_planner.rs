@@ -937,7 +937,7 @@ pub fn plan_answer_pack(
             }
         }
 
-        let Some(best_candidate) = best else {
+        let Some(mut best_candidate) = best else {
             remaining = next_remaining;
             break;
         };
@@ -946,6 +946,24 @@ pub fn plan_answer_pack(
         remaining = next_remaining;
         let candidate = &request.candidates[best_candidate.index];
 
+        let remaining_tokens = diagnostics.budget.evidence_tokens.saturating_sub(used_tokens);
+        if best_candidate.score.token_cost > remaining_tokens {
+            let max_chars = remaining_tokens.saturating_mul(TOKEN_ESTIMATE_CHARS_PER_TOKEN);
+            let retained_chars = max_chars.saturating_sub(3);
+            // Fit the already-redacted excerpt before dropping relevant
+            // evidence. Keep real source text, never just an ellipsis.
+            if best_candidate
+                .excerpt
+                .chars()
+                .take(retained_chars)
+                .any(|character| !character.is_whitespace())
+            {
+                let (excerpt, _) = truncate_excerpt(&best_candidate.excerpt, max_chars);
+                best_candidate.score.token_cost = estimated_tokens(&excerpt);
+                best_candidate.excerpt = excerpt;
+                best_candidate.excerpt_truncated = true;
+            }
+        }
         if used_tokens.saturating_add(best_candidate.score.token_cost)
             > diagnostics.budget.evidence_tokens
         {
@@ -4164,7 +4182,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_high_score_candidate_can_be_skipped_for_budget_fit() {
+    fn oversized_high_score_candidate_is_shortened_before_lower_ranked_evidence() {
         let mut oversized = candidate("oversized", "local", "/s/oversized.jsonl", 10.0);
         let mut fitting = candidate("fit", "remote", "/s/fit.jsonl", 9.0);
 
@@ -4173,12 +4191,76 @@ mod tests {
         let evidence_budget = pack_planner_budget(&req.limits).unwrap().evidence_tokens;
         oversized.excerpt = "x".repeat((evidence_budget + 1) * TOKEN_ESTIMATE_CHARS_PER_TOKEN);
         fitting.excerpt = "y".repeat(TOKEN_ESTIMATE_CHARS_PER_TOKEN);
-        req.candidates = vec![oversized, fitting];
+        req.candidates = vec![oversized.clone(), fitting];
 
         let plan = plan_answer_pack(req).unwrap();
 
-        assert_eq!(plan.evidence[0].candidate.candidate_id, "fit");
+        let selected = &plan.evidence[0];
+        assert_eq!(selected.candidate, oversized);
+        assert_eq!(selected.id, evidence_id(&oversized));
+        assert_eq!(selected.estimated_tokens, evidence_budget);
+        assert_eq!(selected.selection.token_cost, evidence_budget);
+        assert!(selected.excerpt_truncated);
+        assert_eq!(
+            selected.excerpt,
+            format!("{}...", "x".repeat(evidence_budget * 4 - 3))
+        );
         assert_eq!(plan.omitted.len(), 1);
+        assert_eq!(plan.omitted[0].candidate_id, "fit");
+        assert_eq!(
+            plan.omitted[0].reason,
+            PackOmittedReason::TokenBudgetExhausted
+        );
+    }
+
+    #[test]
+    fn budget_truncation_uses_remaining_tokens_and_preserves_unicode_citations() {
+        for remaining_tokens in [1, 2, 20] {
+            let mut first = candidate("first", "local", "/s/first.jsonl", 10.0);
+            let mut second = candidate("second", "remote", "/s/second.jsonl", 9.0);
+            let mut req = request(Vec::new());
+            req.limits.max_excerpt_chars = 8_000;
+            let budget = pack_planner_budget(&req.limits).unwrap().evidence_tokens;
+            first.excerpt = "x".repeat((budget - remaining_tokens) * 4);
+            second.excerpt = "界😀e\u{301}".repeat(100);
+            req.candidates = vec![first, second.clone()];
+
+            let plan = plan_answer_pack(req).unwrap();
+            assert_eq!(plan.evidence.len(), 2);
+            let selected = &plan.evidence[1];
+            let expected: String = second
+                .excerpt
+                .chars()
+                .take(remaining_tokens * 4 - 3)
+                .collect();
+            assert_eq!(selected.excerpt, format!("{expected}..."));
+            assert!(selected.excerpt_truncated);
+            assert_eq!(selected.candidate, second);
+            assert_eq!(selected.id, evidence_id(&second));
+            assert_eq!(selected.estimated_tokens, remaining_tokens);
+            assert_eq!(selected.selection.token_cost, remaining_tokens);
+            assert_eq!(plan.estimated_tokens, budget);
+            assert!(plan.omitted.is_empty());
+        }
+    }
+
+    #[test]
+    fn budget_truncation_does_not_replace_source_text_with_only_an_ellipsis() {
+        let mut first = candidate("first", "local", "/s/first.jsonl", 10.0);
+        let mut whitespace = candidate("whitespace", "remote", "/s/space.jsonl", 9.0);
+        let mut req = request(Vec::new());
+        req.limits.max_excerpt_chars = 8_000;
+        let budget = pack_planner_budget(&req.limits).unwrap().evidence_tokens;
+        first.excerpt = "x".repeat((budget - 1) * 4);
+        whitespace.excerpt = " \t\n meaningful evidence".to_string();
+        req.candidates = vec![first, whitespace];
+
+        let plan = plan_answer_pack(req).unwrap();
+        assert_eq!(plan.evidence.len(), 1);
+        assert!(!plan.evidence[0].excerpt_truncated);
+        assert_eq!(plan.estimated_tokens, budget - 1);
+        assert_eq!(plan.omitted.len(), 1);
+        assert_eq!(plan.omitted[0].candidate_id, "whitespace");
         assert_eq!(
             plan.omitted[0].reason,
             PackOmittedReason::TokenBudgetExhausted

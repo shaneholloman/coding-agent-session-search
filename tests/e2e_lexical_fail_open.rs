@@ -927,6 +927,110 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
 }
 
 #[test]
+fn structured_pack_shortens_large_evidence_without_losing_verified_citations() {
+    use sha2::Digest as _;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("pack_budget_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let filename = "rollout-pack-budget.jsonl";
+    let secret = format!("sk-{}", "A".repeat(40));
+    let body = format!(
+        "budgetexcerptneedle {} api_key={secret} {}",
+        "界".repeat(2_400),
+        "終".repeat(1_000)
+    );
+    seed_codex_session(&codex_home, filename, &body);
+    run_fresh_index(home, &data_dir);
+    let source_path = codex_home.join("sessions/2026/04/23").join(filename);
+    let source = fs::read_to_string(&source_path).unwrap();
+    let before = data_tree_snapshot(&data_dir);
+    let mut packs = Vec::new();
+    for max_tokens in ["12000", "1024"] {
+        let output = cass_cmd(home)
+            .args([
+                "pack",
+                "budgetexcerptneedle",
+                "--json",
+                "--mode",
+                "lexical",
+                "--require-evidence",
+                "--max-tokens",
+                max_tokens,
+                "--max-excerpt-chars",
+                "8000",
+                "--freshness-policy",
+                "allow-stale",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .timeout(Duration::from_secs(20))
+            .output()
+            .expect("pack long evidence at the requested budget");
+        assert!(
+            output.status.success(),
+            "pack must shorten useful evidence to fit: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rendered = String::from_utf8(output.stdout).unwrap();
+        assert!(!rendered.contains(&secret));
+        assert!(!rendered.contains("sk-"));
+        packs.push(serde_json::from_str::<Value>(&rendered).unwrap());
+        assert_eq!(source, fs::read_to_string(&source_path).unwrap());
+        assert_eq!(before, data_tree_snapshot(&data_dir));
+    }
+    let full_evidence = packs[0]["evidence"].as_array().unwrap();
+    let short_evidence = packs[1]["evidence"].as_array().unwrap();
+    assert_eq!(full_evidence.len(), 2);
+    assert_eq!(short_evidence.len(), 1);
+    let shortened = &short_evidence[0];
+    let full = full_evidence
+        .iter()
+        .find(|item| item["id"] == shortened["id"])
+        .expect("shortening must preserve the selected citation identity");
+    let full_excerpt = full["excerpt"].as_str().unwrap();
+    let short_excerpt = shortened["excerpt"].as_str().unwrap();
+    let evidence_tokens = 1_024 * 60 / 100;
+    let expected: String = full_excerpt
+        .chars()
+        .take(evidence_tokens * 4 - 3)
+        .collect();
+    assert!(full_excerpt.chars().count() > evidence_tokens * 4);
+    assert_eq!(short_excerpt, format!("{expected}..."));
+    assert_eq!(shortened["excerpt_truncated"], true);
+    assert_eq!(full["excerpt_truncated"], false);
+    assert_eq!(shortened["estimated_tokens"], evidence_tokens);
+    assert_eq!(shortened["selection"]["token_cost"], evidence_tokens);
+    assert_eq!(packs[1]["limits"]["estimated_tokens"], evidence_tokens);
+    assert_eq!(shortened["citation"]["verified"], true);
+    assert_eq!(
+        shortened["citation"]["excerpt_sha256"],
+        hex::encode(sha2::Sha256::digest(short_excerpt.as_bytes()))
+    );
+    assert_ne!(
+        shortened["citation"]["excerpt_sha256"],
+        full["citation"]["excerpt_sha256"]
+    );
+    for (field, value) in shortened["citation"].as_object().unwrap() {
+        if field != "excerpt_sha256" && field != "freshness_age_seconds" {
+            assert_eq!(value, &full["citation"][field], "citation field {field}");
+        }
+    }
+    let line = shortened["citation"]["line_start"].as_u64().unwrap() as usize;
+    let cited = source.lines().nth(line - 1).unwrap();
+    assert!(cited.contains("budgetexcerptneedle"));
+    assert_eq!(
+        shortened["citation"]["span_hash"],
+        blake3::hash(cited.as_bytes()).to_hex().to_string()
+    );
+    let omitted = packs[1]["omitted"]["items"].as_array().unwrap();
+    assert_eq!(omitted.len(), 1);
+    assert_eq!(omitted[0]["reason"], "token_budget_exhausted");
+}
+
+#[test]
 fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
     use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
