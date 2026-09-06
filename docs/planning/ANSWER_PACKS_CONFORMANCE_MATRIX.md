@@ -85,7 +85,7 @@ are clear.
 | AP-SCHEMA-001 | MUST | JSON Response Schema | All object keys are stable and snake_case. | Golden plus schema walk rejecting non-snake keys. | Planned |
 | AP-SCHEMA-002 | MUST | JSON Response Schema | `_meta.partial`, format, request id, generated time, elapsed time, and warnings are present. | Scrubbed JSON golden. | Planned |
 | AP-SCHEMA-003 | MUST | JSON Response Schema | `realized` truthfully reports search mode, fallback, semantic join, candidates, selected evidence, and selected sessions. | Fixture covering lexical fallback and semantic unavailable. | Planned |
-| AP-EV-001 | MUST | Evidence Item Schema | Evidence ids use `ev_<base32(blake3(citation core))>` and are stable. | `source_citation_ids_follow_verified_spans_and_unverified_exits` and the real structured-pack fixture bind IDs to verified lines/hashes, preserve repeated-verification identity and update it after source relocation/loss. Current encoding is still truncated hexadecimal, not the specified base32. | Unit/CLI Partial |
+| AP-EV-001 | MUST | Evidence Item Schema | Evidence ids use `ev_<base32(blake3(citation core))>` and are stable. | `evidence_ids_encode_the_full_digest_as_base32` checks independent known answers and preservation of the final hash bit. The source-verification tests cover stable/rebound IDs; the real structured-pack fixture independently decodes the complete digest and checks references across JSON, compact, JSONL and TOON. Gate Z passed these checks; mandatory UBS remains unresolved. | Unit/CLI Partial |
 | AP-EV-002 | MUST | Evidence Item Schema | Evidence rank is one-indexed final pack rank. | Planner ordering unit test. | Planned |
 | AP-EV-003 | MUST | Evidence Item Schema | Excerpts are UTF-8-safe, redacted before token estimation, and mark truncation. | `pack_redacts_credentials_before_excerpt_truncation` and `pack_budgets_emitted_text_after_redaction_expansion_and_unicode`; complete CLI privacy-policy matrix remains. | Unit Partial |
 | AP-EV-004 | MUST | Evidence Item Schema | Every selected evidence item includes citation, selection, roles, matched terms, and redactions fields. | JSON schema/golden assertion. | Planned |
@@ -227,6 +227,15 @@ excluded from this structured-pack run and remains pending a shared-file
 reservation for its privately validated dispatch fix. No golden was regenerated.
 
 ## Known Draft Gaps
+
+The full-digest base32 change passed gate Z's 199 selected executions on
+2026-09-05, with formatting and all-target clippy also passing. The receipt is
+`/tmp/cass-pack-base32-gate-20260905-z.log`, source-content SHA-256
+`5f36758a65b5e9eb81151680a12e234f9b2b99edc8ed01c2d30e3872b7929b3a`.
+The complete gate remains red: UBS reported 106 critical labels and 975 warnings
+on the two whole Rust files, and concurrent commits changed checkout metadata.
+The build-input digest was rechecked unchanged afterward. No golden was
+regenerated, no finding waived, and no full-contract or performance claim made.
 
 - Planner unit tests cover several selection rows, but they do not by themselves
   satisfy this matrix. Full conformance requires contract coverage across the
