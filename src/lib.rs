@@ -31013,46 +31013,6 @@ fn pack_budget_block(
     block
 }
 
-fn update_pack_value_runtime_metadata(
-    value: &mut serde_json::Value,
-    budget: &crate::robot_budget_envelope::BudgetBlock,
-    elapsed_ms: u64,
-) -> Result<(), serde_json::Error> {
-    if let Some(object) = value.as_object_mut() {
-        object.insert("budget".to_string(), serde_json::to_value(budget)?);
-        if let Some(meta) = object
-            .get_mut("_meta")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            meta.insert("elapsed_ms".to_string(), elapsed_ms.into());
-            meta.insert(
-                "partial".to_string(),
-                (budget.timed_out || !budget.skipped_sections.is_empty()).into(),
-            );
-        }
-    }
-    Ok(())
-}
-
-fn update_pack_jsonl_runtime_metadata(
-    rendered: String,
-    budget: &crate::robot_budget_envelope::BudgetBlock,
-    elapsed_ms: u64,
-) -> Result<String, serde_json::Error> {
-    let mut lines = rendered.lines();
-    let Some(header) = lines.next() else {
-        return Ok(rendered);
-    };
-    let mut header: serde_json::Value = serde_json::from_str(header)?;
-    update_pack_value_runtime_metadata(&mut header, budget, elapsed_ms)?;
-    let mut updated = serde_json::to_string(&header)?;
-    for line in lines {
-        updated.push('\n');
-        updated.push_str(line);
-    }
-    Ok(updated)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn pack_retry_command(
     data_dir: &Path,
@@ -31199,9 +31159,7 @@ fn run_cli_pack(
     use crate::search::pack_planner::{
         PackLexicalReadiness, PackPlanRequest, PackPlannerLimits, PackReadinessSnapshot,
         PackRenderFormat, PackRenderRequest, PackSemanticReadiness, budget_fallback_answer_pack,
-        pack_candidate_fetch_limit, plan_answer_pack, render_answer_pack, render_answer_pack_value,
-        render_answer_pack_value_without_trust_correlation,
-        render_answer_pack_without_trust_correlation,
+        pack_candidate_fetch_limit, plan_answer_pack,
     };
     use crate::search::query::{FieldMask, SearchFilters};
     use crate::sources::provenance::SourceFilter;
@@ -31374,7 +31332,7 @@ fn run_cli_pack(
             Some(crate::search::query::SearchMode::Lexical),
             timeout_ms,
             start_time,
-            false,
+            true,
             false,
         )?)
     };
@@ -31670,54 +31628,47 @@ fn run_cli_pack(
     };
 
     if !structured_pack {
-        let rendered = render_answer_pack(&plan, &render_request).map_err(|err| CliError {
-            code: 9,
-            kind: CliErrorKind::EncodeJson.kind_str(),
-            message: format!(
-                "failed to render answer pack as {}: {}",
-                err.format, err.message
-            ),
-            hint: None,
-            retryable: false,
-        })?;
-        println!("{rendered}");
-        return Ok(());
-    }
-
-    enum BoundedPackRender {
-        Value(serde_json::Value),
-        Jsonl(String),
+        let correlation = crate::search::trust_correlation::build_for_cwd();
+        let rendered = render_cli_pack_with_output_budget(
+            plan,
+            render_request,
+            fields.as_ref(),
+            require_evidence,
+            start_time,
+            &correlation,
+        )?;
+        return write_cli_pack_output(&rendered);
     }
 
     let render_with_correlation = {
         let plan = plan.clone();
         let request = render_request.clone();
+        let fields = fields.clone();
         move || {
             maybe_test_pack_render_delay();
-            match request.format {
-                PackRenderFormat::Json | PackRenderFormat::CompactJson | PackRenderFormat::Toon => {
-                    render_answer_pack_value(&plan, &request).map(BoundedPackRender::Value)
-                }
-                PackRenderFormat::Jsonl => {
-                    render_answer_pack(&plan, &request).map(BoundedPackRender::Jsonl)
-                }
-                PackRenderFormat::Markdown => unreachable!(),
-            }
+            let correlation = crate::search::trust_correlation::build_for_cwd();
+            render_cli_pack_with_output_budget(
+                plan,
+                request,
+                fields.as_ref(),
+                require_evidence,
+                start_time,
+                &correlation,
+            )
         }
     };
     let render_without_correlation =
         |plan: &crate::search::pack_planner::PlannedAnswerPack, request: &PackRenderRequest| {
-            match request.format {
-                PackRenderFormat::Json | PackRenderFormat::CompactJson | PackRenderFormat::Toon => {
-                    render_answer_pack_value_without_trust_correlation(plan, request)
-                        .map(BoundedPackRender::Value)
-                }
-                PackRenderFormat::Jsonl => {
-                    render_answer_pack_without_trust_correlation(plan, request)
-                        .map(BoundedPackRender::Jsonl)
-                }
-                PackRenderFormat::Markdown => unreachable!(),
-            }
+            let correlation = crate::search::trust_correlation::CorrelationIndex::default();
+            render_cli_pack_with_output_budget(
+                plan.clone(),
+                request.clone(),
+                fields.as_ref(),
+                // A timed-out fallback never fabricates required evidence.
+                false,
+                start_time,
+                &correlation,
+            )
         };
     let render_budget_fallback =
         budget_fallback_answer_pack(&limits, candidate_count).map_err(pack_invalid_limit_error)?;
@@ -31788,7 +31739,27 @@ fn run_cli_pack(
             }
         }
     };
-    let mut rendered = render_result.map_err(|err| CliError {
+    let rendered = render_result?;
+    if fields.is_some() && matches!(render_format, PackRenderFormat::Jsonl) {
+        eprintln!("Warning: --fields is ignored for pack JSONL output.");
+    }
+    write_cli_pack_output(&rendered)
+}
+
+fn render_cli_pack_with_output_budget(
+    mut plan: crate::search::pack_planner::PlannedAnswerPack,
+    mut request: crate::search::pack_planner::PackRenderRequest,
+    fields: Option<&Vec<String>>,
+    require_evidence: bool,
+    start_time: Instant,
+    correlation: &crate::search::trust_correlation::CorrelationIndex,
+) -> CliResult<String> {
+    use crate::search::pack_planner::{
+        PackRenderFormat, render_answer_pack_value_with_correlation,
+        render_answer_pack_with_correlation,
+    };
+    let token_limit = plan.diagnostics.budget.max_output_tokens_with_overflow;
+    let render_error = |err: crate::search::pack_planner::PackRenderError| CliError {
         code: 9,
         kind: CliErrorKind::EncodeJson.kind_str(),
         message: format!(
@@ -31797,62 +31768,75 @@ fn run_cli_pack(
         ),
         hint: None,
         retryable: false,
-    })?;
-
-    if !hard_deadline_reached {
-        render_request.budget = pack_budget_block(
-            &pack_budget,
-            skipped_sections.clone(),
-            recommended_probe_for(&skipped_sections),
-            false,
-        );
-        render_request.elapsed_ms = start_time.elapsed().as_millis() as u64;
-    }
-
-    match &mut rendered {
-        BoundedPackRender::Value(value) => {
-            update_pack_value_runtime_metadata(
-                value,
-                &render_request.budget,
-                render_request.elapsed_ms,
-            )
-            .map_err(|err| CliError {
-                code: 9,
-                kind: CliErrorKind::EncodeJson.kind_str(),
-                message: format!("failed to update answer-pack budget metadata: {err}"),
-                hint: None,
-                retryable: false,
-            })?;
-            let value = filter_pack_fields(std::mem::take(value), fields.as_ref())?;
-            let output_format = match render_format {
-                PackRenderFormat::Json => RobotFormat::Json,
-                PackRenderFormat::CompactJson => RobotFormat::Compact,
-                PackRenderFormat::Toon => RobotFormat::Toon,
-                PackRenderFormat::Jsonl | PackRenderFormat::Markdown => unreachable!(),
-            };
-            output_structured_value(value, output_format)?;
+    };
+    loop {
+        // Freeze runtime metadata before encoding and measuring. No bytes may
+        // be appended or metadata changed after final output admission.
+        if !request.budget.timed_out {
+            request.elapsed_ms = start_time.elapsed().as_millis() as u64;
+            request.budget.elapsed_ms = request.elapsed_ms;
         }
-        BoundedPackRender::Jsonl(rendered) => {
-            if fields.is_some() {
-                eprintln!("Warning: --fields is ignored for pack JSONL output.");
+        let mut output = match request.format {
+            PackRenderFormat::Json | PackRenderFormat::CompactJson | PackRenderFormat::Toon => {
+                let value = render_answer_pack_value_with_correlation(&plan, &request, correlation)
+                    .map_err(render_error)?;
+                let value = filter_pack_fields(value, fields)?;
+                let format = match request.format {
+                    PackRenderFormat::Json => RobotFormat::Json,
+                    PackRenderFormat::CompactJson => RobotFormat::Compact,
+                    _ => RobotFormat::Toon,
+                };
+                encode_structured_value(value, format)?
             }
-            let updated = update_pack_jsonl_runtime_metadata(
-                std::mem::take(rendered),
-                &render_request.budget,
-                render_request.elapsed_ms,
-            )
-            .map_err(|err| CliError {
-                code: 9,
-                kind: CliErrorKind::EncodeJson.kind_str(),
-                message: format!("failed to update answer-pack JSONL budget metadata: {err}"),
-                hint: None,
+            PackRenderFormat::Jsonl | PackRenderFormat::Markdown => {
+                render_answer_pack_with_correlation(&plan, &request, correlation)
+                    .map_err(render_error)?
+            }
+        };
+        if !matches!(request.format, PackRenderFormat::Toon) {
+            output.push('\n');
+        }
+        let output_tokens = output.chars().count().div_ceil(4);
+        if output_tokens <= token_limit {
+            return Ok(output);
+        }
+        if !plan.reduce_for_output_budget(output_tokens - token_limit, require_evidence) {
+            return Err(CliError {
+                code: 2,
+                kind: "pack-budget-too-small",
+                message: format!(
+                    "pack output needs {output_tokens} estimated tokens, exceeding the {token_limit}-token tolerance for --max-tokens {}",
+                    request.limits.max_tokens
+                ),
+                hint: Some(
+                    if matches!(
+                        request.format,
+                        PackRenderFormat::Jsonl | PackRenderFormat::Markdown
+                    ) {
+                        "Increase --max-tokens or shorten query metadata; required citation fields are preserved."
+                    } else {
+                        "Increase --max-tokens or select fewer output fields; required citation fields are preserved."
+                    }
+                    .to_string(),
+                ),
                 retryable: false,
-            })?;
-            println!("{updated}");
+            });
         }
     }
+}
 
-    Ok(())
+fn write_cli_pack_output(output: &str) -> CliResult<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    out.write_all(output.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|error| CliError {
+            code: 9,
+            kind: CliErrorKind::Io.kind_str(),
+            message: format!("failed to write answer pack: {error}"),
+            hint: None,
+            retryable: false,
+        })
 }
 
 fn resolve_pack_render_format(
@@ -32244,6 +32228,100 @@ fn merge_json_value(target: &mut serde_json::Value, incoming: serde_json::Value)
 #[cfg(test)]
 mod pack_field_mask_tests {
     use super::*;
+
+    #[test]
+    fn pack_output_budget_measures_final_encoding_and_newline_at_the_boundary() {
+        use crate::search::pack_planner::{PackPlanRequest, PackRenderFormat, PackRenderRequest};
+        let correlation = crate::search::trust_correlation::CorrelationIndex::default();
+        for format in [
+            PackRenderFormat::Json,
+            PackRenderFormat::CompactJson,
+            PackRenderFormat::Jsonl,
+            PackRenderFormat::Toon,
+            PackRenderFormat::Markdown,
+        ] {
+            let plan =
+                crate::search::pack_planner::plan_answer_pack(PackPlanRequest::default()).unwrap();
+            let mut request = PackRenderRequest {
+                format,
+                query_text: "quote \" slash \\ control \u{1} Unicode 界😀".to_string(),
+                ..PackRenderRequest::default()
+            };
+            // Fixed elapsed metadata makes the exact boundary reproducible.
+            request.budget.timed_out = true;
+            let output = render_cli_pack_with_output_budget(
+                plan.clone(),
+                request.clone(),
+                None,
+                false,
+                Instant::now(),
+                &correlation,
+            )
+            .unwrap();
+            let tokens = output.chars().count().div_ceil(4);
+            let mut boundary = plan;
+            boundary.diagnostics.budget.max_output_tokens_with_overflow = tokens;
+            let exact = render_cli_pack_with_output_budget(
+                boundary.clone(),
+                request.clone(),
+                None,
+                false,
+                Instant::now(),
+                &correlation,
+            )
+            .unwrap();
+            assert_eq!(exact, output);
+            boundary.diagnostics.budget.max_output_tokens_with_overflow = tokens - 1;
+            let error = render_cli_pack_with_output_budget(
+                boundary,
+                request,
+                None,
+                false,
+                Instant::now(),
+                &correlation,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, "pack-budget-too-small");
+            assert_eq!(error.code, 2);
+            assert!(!error.retryable);
+        }
+    }
+
+    #[test]
+    fn pack_output_budget_measures_the_field_projection_not_hidden_metadata() {
+        use crate::search::pack_planner::{PackPlanRequest, PackRenderRequest};
+        let plan =
+            crate::search::pack_planner::plan_answer_pack(PackPlanRequest::default()).unwrap();
+        let request = PackRenderRequest {
+            request_id: Some("large hidden request metadata ".repeat(3_000)),
+            ..PackRenderRequest::default()
+        };
+        let correlation = crate::search::trust_correlation::CorrelationIndex::default();
+        let error = render_cli_pack_with_output_budget(
+            plan.clone(),
+            request.clone(),
+            None,
+            false,
+            Instant::now(),
+            &correlation,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, "pack-budget-too-small");
+        let fields = vec!["limits".to_string()];
+        let output = render_cli_pack_with_output_budget(
+            plan,
+            request,
+            Some(&fields),
+            false,
+            Instant::now(),
+            &correlation,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 1);
+        assert!(value["limits"].is_object());
+        assert!(!output.contains("large hidden"));
+    }
 
     fn sample_pack_value() -> serde_json::Value {
         serde_json::json!({

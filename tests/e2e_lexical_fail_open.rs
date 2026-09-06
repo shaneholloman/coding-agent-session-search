@@ -961,6 +961,8 @@ fn structured_pack_shortens_large_evidence_without_losing_verified_citations() {
                 max_tokens,
                 "--max-excerpt-chars",
                 "8000",
+                "--fields",
+                "evidence,limits,omitted",
                 "--freshness-policy",
                 "allow-stale",
                 "--data-dir",
@@ -977,6 +979,8 @@ fn structured_pack_shortens_large_evidence_without_losing_verified_citations() {
         let rendered = String::from_utf8(output.stdout).unwrap();
         assert!(!rendered.contains(&secret));
         assert!(!rendered.contains("sk-"));
+        let budget: usize = max_tokens.parse().unwrap();
+        assert!(rendered.chars().count().div_ceil(4) <= budget + budget / 20);
         packs.push(serde_json::from_str::<Value>(&rendered).unwrap());
         assert_eq!(source, fs::read_to_string(&source_path).unwrap());
         assert_eq!(before, data_tree_snapshot(&data_dir));
@@ -992,9 +996,15 @@ fn structured_pack_shortens_large_evidence_without_losing_verified_citations() {
         .expect("shortening must preserve the selected citation identity");
     let full_excerpt = full["excerpt"].as_str().unwrap();
     let short_excerpt = shortened["excerpt"].as_str().unwrap();
-    let evidence_tokens = 1_024 * 60 / 100;
-    let expected: String = full_excerpt.chars().take(evidence_tokens * 4 - 3).collect();
-    assert!(full_excerpt.chars().count() > evidence_tokens * 4);
+    let evidence_tokens = short_excerpt.chars().count().div_ceil(4);
+    // Final output also pays for citations, omission records and JSON syntax.
+    // The planner's 60% excerpt allowance is an upper bound, not the emitted cost.
+    assert!(evidence_tokens > 1 && evidence_tokens <= 1_024 * 60 / 100);
+    let expected: String = full_excerpt
+        .chars()
+        .take(short_excerpt.chars().count() - 3)
+        .collect();
+    assert!(full_excerpt.chars().count() > short_excerpt.chars().count());
     assert_eq!(short_excerpt, format!("{expected}..."));
     assert_eq!(shortened["excerpt_truncated"], true);
     assert_eq!(full["excerpt_truncated"], false);
@@ -1025,6 +1035,217 @@ fn structured_pack_shortens_large_evidence_without_losing_verified_citations() {
     let omitted = packs[1]["omitted"]["items"].as_array().unwrap();
     assert_eq!(omitted.len(), 1);
     assert_eq!(omitted[0]["reason"], "token_budget_exhausted");
+}
+
+#[test]
+fn pack_final_output_budget_bounds_all_formats_and_refuses_oversized_metadata() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("final_pack_budget");
+    fs::create_dir_all(&data_dir).unwrap();
+    for index in 0..6 {
+        seed_codex_session(
+            &codex_home,
+            &format!("rollout-output-budget-{index}.jsonl"),
+            &format!(
+                "finalbudgetneedle session{index} {}",
+                "界😀\"\\\u{1}`".repeat(450)
+            ),
+        );
+    }
+    run_fresh_index(home, &data_dir);
+    let archive_before = data_tree_snapshot(&data_dir);
+    let sources_before = data_tree_snapshot(&codex_home);
+    let budget: usize = 3_600;
+    let mut reduced_formats = 0;
+    for format in ["json", "compact", "jsonl", "toon", "markdown"] {
+        let mut command = cass_cmd(home);
+        command
+            .args([
+                "pack",
+                "finalbudgetneedle",
+                "--mode",
+                "lexical",
+                "--require-evidence",
+                "--freshness-policy",
+                "allow-stale",
+                "--max-excerpt-chars",
+                "8000",
+                "--max-tokens",
+                &budget.to_string(),
+                "--data-dir",
+            ])
+            .arg(&data_dir);
+        if format == "markdown" {
+            command.args(["--display", "markdown"]);
+        } else {
+            command.args(["--robot-format", format]);
+        }
+        let output = command.timeout(Duration::from_secs(20)).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{format}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.chars().count().div_ceil(4) <= budget + budget / 20,
+            "{format}"
+        );
+        if format == "markdown" {
+            let mut excerpts = 0;
+            for event in pulldown_cmark::Parser::new(&text) {
+                if matches!(
+                    event,
+                    pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_))
+                ) {
+                    excerpts += 1;
+                }
+            }
+            assert!(excerpts > 0, "bounded Markdown must retain real evidence");
+        } else {
+            let evidence = match format {
+                "jsonl" => text
+                    .lines()
+                    .filter_map(|line| {
+                        serde_json::from_str::<Value>(line)
+                            .unwrap()
+                            .get("evidence")
+                            .cloned()
+                    })
+                    .collect::<Vec<_>>(),
+                "toon" => Value::from(toon::try_decode(&text, None).unwrap())["evidence"]
+                    .as_array()
+                    .unwrap()
+                    .clone(),
+                _ => serde_json::from_str::<Value>(&text).unwrap()["evidence"]
+                    .as_array()
+                    .unwrap()
+                    .clone(),
+            };
+            assert!(
+                !evidence.is_empty(),
+                "{format} must preserve required evidence"
+            );
+            let excerpt_tokens: usize = evidence
+                .iter()
+                .map(|item| {
+                    let tokens = item["excerpt"]
+                        .as_str()
+                        .unwrap()
+                        .chars()
+                        .count()
+                        .div_ceil(4);
+                    // TOON represents numbers as f64. Compare exact numeric
+                    // values to a cost derived independently from emitted text.
+                    assert_eq!(
+                        toon::JsonValue::from(item["estimated_tokens"].clone()),
+                        toon::JsonValue::from(serde_json::json!(tokens))
+                    );
+                    tokens
+                })
+                .sum();
+            if excerpt_tokens < budget * 60 / 100 {
+                reduced_formats += 1;
+            }
+            for item in evidence {
+                assert_eq!(item["citation"]["verified"], true);
+                let source =
+                    fs::read_to_string(item["citation"]["source_path"].as_str().unwrap()).unwrap();
+                let line_index = source
+                    .lines()
+                    .position(|line| {
+                        blake3::hash(line.as_bytes()).to_hex().as_str()
+                            == item["citation"]["span_hash"].as_str().unwrap()
+                    })
+                    .expect("citation hash must identify an original source line");
+                let line = line_index + 1;
+                assert_eq!(
+                    toon::JsonValue::from(item["citation"]["line_start"].clone()),
+                    toon::JsonValue::from(serde_json::json!(line))
+                );
+            }
+        }
+        assert_eq!(archive_before, data_tree_snapshot(&data_dir));
+        assert_eq!(sources_before, data_tree_snapshot(&codex_home));
+    }
+    assert!(
+        reduced_formats > 0,
+        "fixture must exercise final-output reduction"
+    );
+
+    let request_id = "metadata-overflow-".repeat(1_000);
+    for format in ["json", "compact", "jsonl", "toon"] {
+        let output = cass_cmd(home)
+            .args([
+                "pack",
+                "finalbudgetneedle",
+                "--mode",
+                "lexical",
+                "--robot-format",
+                format,
+                "--max-tokens",
+                "1024",
+                "--request-id",
+                &request_id,
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .timeout(Duration::from_secs(20))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{format}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "no partial output on budget error: {format}"
+        );
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "pack-budget-too-small");
+        assert_eq!(error["error"]["retryable"], false);
+    }
+    let masked = cass_cmd(home)
+        .args([
+            "pack",
+            "finalbudgetneedle",
+            "--json",
+            "--mode",
+            "lexical",
+            "--max-tokens",
+            "1024",
+            "--request-id",
+            &request_id,
+            "--fields",
+            "limits",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .unwrap();
+    assert!(
+        masked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&masked.stderr)
+    );
+    let projected: Value = serde_json::from_slice(&masked.stdout).unwrap();
+    assert_eq!(projected.as_object().unwrap().len(), 1);
+    assert!(projected["limits"].is_object());
+    assert!(
+        String::from_utf8(masked.stdout)
+            .unwrap()
+            .chars()
+            .count()
+            .div_ceil(4)
+            <= 1_075
+    );
+    assert_eq!(archive_before, data_tree_snapshot(&data_dir));
+    assert_eq!(sources_before, data_tree_snapshot(&codex_home));
 }
 
 #[test]

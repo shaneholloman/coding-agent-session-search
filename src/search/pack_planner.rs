@@ -358,6 +358,65 @@ pub struct PlannedAnswerPack {
     pub omitted: Vec<OmittedPackCandidate>,
 }
 
+impl PlannedAnswerPack {
+    /// Make progress toward a measured final-output bound without changing
+    /// citation identity. Rendering must be repeated after each reduction:
+    /// escaping, handoff text and format overhead affect the actual savings.
+    pub(crate) fn reduce_for_output_budget(
+        &mut self,
+        excess_tokens: usize,
+        require_evidence: bool,
+    ) -> bool {
+        let Some(item) = self.evidence.last_mut() else {
+            return false;
+        };
+        let chars = item.excerpt.chars().count();
+        let max_chars = chars
+            .saturating_sub(
+                excess_tokens
+                    .max(1)
+                    .saturating_mul(TOKEN_ESTIMATE_CHARS_PER_TOKEN),
+            )
+            .max(4);
+        if max_chars < chars
+            && item
+                .excerpt
+                .chars()
+                .take(max_chars - 3)
+                .any(|character| !character.is_whitespace())
+        {
+            let (excerpt, _) = truncate_excerpt(&item.excerpt, max_chars);
+            self.estimated_tokens = self.estimated_tokens.saturating_sub(item.estimated_tokens);
+            item.excerpt = excerpt;
+            item.excerpt_truncated = true;
+            item.estimated_tokens = estimated_tokens(&item.excerpt);
+            item.selection.token_cost = item.estimated_tokens;
+            self.estimated_tokens += item.estimated_tokens;
+            return true;
+        }
+        if require_evidence && self.evidence.len() == 1 {
+            return false;
+        }
+        let Some(item) = self.evidence.pop() else {
+            return false;
+        };
+        self.estimated_tokens = self.estimated_tokens.saturating_sub(item.estimated_tokens);
+        self.omitted.push(omitted_candidate(
+            &item.candidate,
+            PackOmittedReason::TokenBudgetExhausted,
+            item.selection,
+        ));
+        self.selected_evidence_count = self.evidence.len();
+        self.selected_session_count = self
+            .evidence
+            .iter()
+            .map(|item| item.candidate.session_key())
+            .collect::<HashSet<_>>()
+            .len();
+        true
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackPlannerDiagnostics {
     pub candidate_fetch_limit: usize,
@@ -1624,7 +1683,15 @@ pub fn render_answer_pack_without_trust_correlation(
     request: &PackRenderRequest,
 ) -> Result<String, PackRenderError> {
     let correlation = crate::search::trust_correlation::CorrelationIndex::default();
-    let envelope = rendered_answer_pack_with_correlation(plan, request, &correlation);
+    render_answer_pack_with_correlation(plan, request, &correlation)
+}
+
+pub(crate) fn render_answer_pack_with_correlation(
+    plan: &PlannedAnswerPack,
+    request: &PackRenderRequest,
+    correlation: &crate::search::trust_correlation::CorrelationIndex,
+) -> Result<String, PackRenderError> {
+    let envelope = rendered_answer_pack_with_correlation(plan, request, correlation);
     match request.format {
         PackRenderFormat::Json => {
             serde_json::to_string_pretty(&envelope).map_err(|err| render_error(request, err))
@@ -1647,10 +1714,18 @@ pub fn render_answer_pack_value_without_trust_correlation(
     request: &PackRenderRequest,
 ) -> Result<serde_json::Value, PackRenderError> {
     let correlation = crate::search::trust_correlation::CorrelationIndex::default();
+    render_answer_pack_value_with_correlation(plan, request, &correlation)
+}
+
+pub(crate) fn render_answer_pack_value_with_correlation(
+    plan: &PlannedAnswerPack,
+    request: &PackRenderRequest,
+    correlation: &crate::search::trust_correlation::CorrelationIndex,
+) -> Result<serde_json::Value, PackRenderError> {
     serde_json::to_value(rendered_answer_pack_with_correlation(
         plan,
         request,
-        &correlation,
+        correlation,
     ))
     .map_err(|err| render_error(request, err))
 }
@@ -4281,6 +4356,78 @@ mod tests {
             plan.omitted[0].reason,
             PackOmittedReason::TokenBudgetExhausted
         );
+    }
+
+    #[test]
+    fn final_output_reduction_preserves_citations_and_reconciles_dropped_evidence() {
+        let first = candidate("first", "local", "/s/first.jsonl", 10.0);
+        let mut last = candidate("last", "remote", "/s/last.jsonl", 9.0);
+        last.excerpt = "界😀e\u{301}".repeat(20);
+        let mut plan = plan_answer_pack(request(vec![first, last.clone()])).unwrap();
+        let original_first = plan.evidence[0].clone();
+        let original_last_id = plan.evidence[1].id.clone();
+        assert!(plan.reduce_for_output_budget(10_000, true));
+        assert_eq!(plan.evidence[0], original_first);
+        assert_eq!(plan.evidence[1].candidate, last);
+        assert_eq!(plan.evidence[1].id, original_last_id);
+        assert_eq!(plan.evidence[1].excerpt, "界...");
+        assert_eq!(plan.evidence[1].estimated_tokens, 1);
+        assert_eq!(plan.evidence[1].selection.token_cost, 1);
+        assert_eq!(plan.estimated_tokens, original_first.estimated_tokens + 1);
+        assert!(plan.omitted.is_empty());
+
+        assert!(plan.reduce_for_output_budget(10_000, true));
+        assert_eq!(plan.evidence, vec![original_first.clone()]);
+        assert_eq!(plan.selected_evidence_count, 1);
+        assert_eq!(plan.selected_session_count, 1);
+        assert_eq!(plan.estimated_tokens, original_first.estimated_tokens);
+        assert_eq!(plan.omitted.len(), 1);
+        assert_eq!(plan.omitted[0].candidate_id, last.candidate_id);
+        assert_eq!(
+            plan.omitted[0].reason,
+            PackOmittedReason::TokenBudgetExhausted
+        );
+        let rendered = render_answer_pack_value_without_trust_correlation(
+            &plan,
+            &render_request(PackRenderFormat::Json),
+        )
+        .unwrap();
+        assert_eq!(
+            rendered["pack"]["answer_outline"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            rendered["pack"]["handoff"][0]["evidence_ids"][0],
+            original_first.id
+        );
+        assert_eq!(
+            rendered["pack"]["source_summary"].as_array().unwrap().len(),
+            1
+        );
+
+        assert!(plan.reduce_for_output_budget(10_000, true));
+        assert!(!plan.reduce_for_output_budget(10_000, true));
+        assert_eq!(plan.evidence.len(), 1, "required evidence cannot disappear");
+        assert!(plan.reduce_for_output_budget(10_000, false));
+        assert!(plan.evidence.is_empty());
+        assert_eq!(plan.selected_session_count, 0);
+        assert_eq!(plan.selected_evidence_count, 0);
+        assert_eq!(plan.estimated_tokens, 0);
+        assert_eq!(plan.omitted.len(), 2);
+        assert!(!plan.reduce_for_output_budget(10_000, false));
+    }
+
+    #[test]
+    fn final_output_reduction_drops_whitespace_prefix_without_fabricating_text() {
+        let mut item = candidate("space", "local", "/s/space.jsonl", 10.0);
+        item.excerpt = " \t\n meaningful text".to_string();
+        let mut plan = plan_answer_pack(request(vec![item])).unwrap();
+        let before = plan.clone();
+        assert!(!plan.reduce_for_output_budget(10_000, true));
+        assert_eq!(plan, before);
+        assert!(plan.reduce_for_output_budget(10_000, false));
+        assert!(plan.evidence.is_empty());
+        assert_eq!(plan.omitted.len(), 1);
     }
 
     #[test]
