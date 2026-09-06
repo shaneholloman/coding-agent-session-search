@@ -90,7 +90,7 @@ are clear.
 | AP-EV-003 | MUST | Evidence Item Schema | Excerpts are UTF-8-safe, redacted before token estimation, and mark truncation. | `pack_redacts_credentials_before_excerpt_truncation` and `pack_budgets_emitted_text_after_redaction_expansion_and_unicode`; complete CLI privacy-policy matrix remains. | Unit Partial |
 | AP-EV-004 | MUST | Evidence Item Schema | Every selected evidence item includes citation, selection, roles, matched terms, and redactions fields. | JSON schema/golden assertion. | Planned |
 | AP-CIT-001 | MUST | Citation Fields | Citation carries path, source id, origin kind, workspace, agent, line/message positions, ids, hashes, timestamps, match type, and verification status. | Citation schema test with complete fixture. | Planned |
-| AP-CIT-002 | MUST | Citation Fields | Citation path and line fields resolve to readable source lines in the no-mock fixture. | `structured_pack_preserves_stale_checkpoint_and_returns_real_citations` verifies physical local Codex lines and raw-line hashes, then preserves archived evidence after moving the source. Other providers and the citation-path privacy contract remain. | CLI Partial |
+| AP-CIT-002 | MUST | Citation Fields | Citation path and line fields resolve to readable source lines in the no-mock fixture. | `structured_pack_preserves_stale_checkpoint_and_returns_real_citations` verifies physical local Codex lines and raw-line hashes, then preserves archived evidence after moving the source. `structured_pack_shortens_large_evidence_without_losing_verified_citations` also verifies ingestion-redacted evidence; unit negatives reject ambiguous redacted records, changed content and mismatched timestamps. Other providers and the citation-path privacy contract remain. | Unit/CLI Partial |
 | AP-CIT-003 | MUST | Citation Fields | `match_type` uses the existing search robot spelling, not Rust debug variant names. | Aggregation/pack regression for `implicit_wildcard`. | Planned |
 | AP-PACK-001 | MUST | Pack Object Schema | Pack title, answer outline, source summary, and handoff are deterministic display scaffolding, not LLM summaries. | Unit fixture comparing exact output from fixed evidence. | Planned |
 | AP-PACK-002 | MUST | Pack Object Schema | Outline headings are deterministic from matched terms and labels. | Planner/render unit test. | Planned |
@@ -109,9 +109,9 @@ are clear.
 | AP-OMIT-004 | MUST | Omitted Reasons | Budget-omitted candidates are emitted once and not later emitted as max evidence. | `exact_token_budget_boundary_selects_until_budget_exhausted` covers token-budget omission at the exact boundary. | Unit Partial |
 | AP-BUDGET-001 | MUST | Token Budget | Token estimates use ceil UTF-8 char count divided by four after redaction and truncation. | `pack_budgets_emitted_text_after_redaction_expansion_and_unicode` checks actual emitted text, item costs, sum and evidence budget; CLI budget tests cover valid/invalid caps and totals. Complete policy/format coverage remains. | Unit/CLI Partial |
 | AP-BUDGET-002 | MUST | Token Budget | Budget reserves 15% metadata, 15% outline, 60% evidence, 10% omitted/warnings. | Planner budget unit test. | Planned |
-| AP-BUDGET-003 | MUST | Token Budget | Planner shortens excerpts before dropping evidence. | Truncation/drop ordering test. | Planned |
-| AP-BUDGET-004 | MUST | Token Budget | Selected evidence never loses citation fields to fit budget. | Small budget JSON golden. | Planned |
-| AP-BUDGET-005 | MUST | Token Budget | Output may exceed max tokens by no more than 5%; otherwise drop another item or return `pack-budget-too-small`. | `exact_token_budget_boundary_selects_until_budget_exhausted` covers dropping the next item at an exact boundary; overshoot tolerance and too-small error remain. | Unit Partial |
+| AP-BUDGET-003 | MUST | Token Budget | Planner shortens excerpts before dropping evidence. | `oversized_high_score_candidate_is_shortened_before_lower_ranked_evidence` and the remaining-budget Unicode/ellipsis negatives check selection within the excerpt allowance. `structured_pack_shortens_large_evidence_without_losing_verified_citations` exercises real CLI shortening after ingestion redaction. Full serialized-output admission remains separate. | Unit/CLI Partial |
+| AP-BUDGET-004 | MUST | Token Budget | Selected evidence never loses citation fields to fit budget. | Planner tests retain the original candidate and ID. The real CLI shortening fixture compares citation fields across large/small budgets, independently checks the emitted excerpt SHA-256 and original source-line hash, and preserves archive/source bytes. Cross-format coverage and positive goldens remain. | Unit/CLI Partial |
+| AP-BUDGET-005 | MUST | Token Budget | Output may exceed max tokens by no more than 5%; otherwise drop another item or return `pack-budget-too-small`. | Unimplemented: final serialized-output admission and the typed too-small error. Excerpt-only boundary tests do not establish this output-wide bound; metadata, citations, outlines and format overhead must be included. | Planned |
 | AP-HEALTH-001 | MUST | Freshness and Health Proof | Health fields come from the same truth surfaces as `cass health --json` and `cass status --json`. | Fixture with stubbed existing health/status surfaces, not ad hoc values. | Planned |
 | AP-HEALTH-002 | MUST | Freshness and Health Proof | Required health fields include healthy, recommended action, index state, semantic state, fallback mode, active rebuild, and source readiness. | Health schema golden. | Planned |
 | AP-HEALTH-003 | MUST | Freshness and Health Proof | Source readiness includes source id, origin kind, healthy, last sync, last indexed, and recommended action. | Source readiness fixture. | Planned |
@@ -173,7 +173,7 @@ The original planner-only proof set lives in `src/search/pack_planner.rs`:
 |------|---------------|-------|
 | `empty_corpus_returns_empty_plan` | AP-CMD-010, AP-ERR-003 | Planner only; command error/default behavior still needs robot fixtures. |
 | `duplicate_content_is_omitted_after_first_selection` | AP-SEL-006, AP-OMIT-003 | Covers content-hash duplicates only. |
-| `exact_token_budget_boundary_selects_until_budget_exhausted` | AP-BUDGET-005, AP-OMIT-004 | Covers exact boundary drop only. |
+| `exact_token_budget_boundary_selects_until_budget_exhausted` | AP-OMIT-004 | Covers exact excerpt-budget exhaustion only, not AP-BUDGET-005's serialized-output bound. |
 | `source_diversity_changes_second_pick` | AP-SEL-005 | Covers planner selection, not rendered diagnostics. |
 | `strict_freshness_omits_stale_or_unknown_timestamps` | AP-SEL-004 | Covers strict policy omission, not prefer-recent tie order. |
 | `lexical_score_drives_relevance_when_semantic_is_absent` | AP-SCHEMA-003, AP-HEALTH-004 | Planner score proof only; realized mode/fallback metadata still needs command fixtures. |
@@ -225,6 +225,17 @@ failure after concurrent commits. The compiled-input digest was rechecked
 unchanged after those commits. The known Markdown preparation mutation was
 excluded from this structured-pack run and remains pending a shared-file
 reservation for its privately validated dispatch fix. No golden was regenerated.
+
+The excerpt-shortening and ingestion-redacted citation fixes passed gate AB's
+203 selected executions on 2026-09-06, including the new real CLI regression
+that failed in gate AA. Formatting and all-target clippy passed. Receipt:
+`/tmp/cass-pack-excerpt-budget-gate-20260906-ab.log`, source-content SHA-256
+`2e970b0661bcee410cd40e554ccdac19ed81aebd69e0438c0358209bc0526a0f`.
+The complete gate remains red: UBS reported 108 critical labels and 1,089
+warnings across the two whole Rust files, and concurrent commits triggered the
+checkout-stability check. The current build-input digest still matches the
+tested digest. No golden was regenerated or finding waived. These tests cover
+excerpt budgeting, not the complete serialized-output limit.
 
 ## Known Draft Gaps
 
